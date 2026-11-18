@@ -191,11 +191,11 @@ Zip := [].{
 	## The output depends only on the entries, their order and the
 	## compression: timestamps are zeroed, and there are no data descriptors.
 	create : List(ZipEntry), Compression -> Try(List(U8), CreateError)
-	create = |entries, compression| {
-		validate_entries(entries)?
-		var $dir = { offset: 0, central: List.with_capacity(central_dir_capacity(entries)), count: 0 }
-		var $out = List.with_capacity(initial_archive_capacity(entries, compression))
-		for entry in entries {
+	create = |files, compression| {
+		validate_entries(files)?
+		var $dir = { offset: 0, central: List.with_capacity(central_dir_capacity(files)), count: 0 }
+		var $out = List.with_capacity(initial_archive_capacity(files, compression))
+		for entry in files {
 			written = append_content($dir, entry, compression, $out)
 			$dir = written.dir
 			$out = written.out
