@@ -1,6 +1,6 @@
 #!/usr/bin/env roc
-## All tests: the package's `expect` blocks, then forward interop against real
-## ZIP readers.
+## All tests: the package and its public consumer, then forward interop
+## against real ZIP readers.
 ##
 ## The `expect` blocks in Zip.roc cover round-tripping, header layout, ZIP64,
 ## path safety, errors and streamed archives, plus three fixture archives that
@@ -33,7 +33,8 @@ import pf.System
 
 main! = |_| {
 	Stdout.line!("== unit tests")?
-	run!("roc", ["test", "package/main.roc"])?
+	# Testing the local consumer also runs the ZIP package's own expects.
+	run!("roc", ["test", "tests/public_types/main.roc"])?
 
 	Stdout.line!("== forward interop against real ZIP readers (compiled --opt=speed)")?
 	build!("tests/harness.roc", "tests/harness")?

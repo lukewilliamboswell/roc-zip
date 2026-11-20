@@ -78,41 +78,17 @@ max_end_of_central_dir_distance = end_of_central_dir_len + 65535
 max_inflate_ratio : U64
 max_inflate_ratio = 1032
 
-## A file entry in the archive.
-##
-## The `path` can include directories (e.g. `"foo/bar.txt"`).
-ZipEntry : { path : Str, content : List(U8) }
+PrivateZipEntry : { path : Str, content : List(U8) }
 
-## How (and whether) [Zip.create] compresses entries.
-##
-## `None` stores entries uncompressed. The rest compress with DEFLATE,
-## trading speed for size, with the levels of
-## [roc-deflate](https://github.com/niclas-ahden/roc-deflate), a port of libdeflate:
-## `Fastest` is level 1, the quickest, `Balanced` is level 6, zlib's default
-## effort, and `Smallest` is level 12, the smallest archive libdeflate makes.
-##
-## With anything but `None`, an entry whose compressed form would not be
-## smaller (e.g. data that is already compressed) is stored uncompressed
-## instead, as ZIP tools conventionally do.
-Compression : [None, Fastest, Balanced, Smallest]
+PrivateCompression : [None, Fastest, Balanced, Smallest]
 
-## Errors that can occur when creating a ZIP archive.
-##
-## Paths are compared byte for byte, so `DuplicatePath` names a path that was
-## already written.
-CreateError : [
+PrivateCreateError : [
 	EmptyPath(Str),
 	PathTooLong(Str),
 	DuplicatePath(Str),
 ]
 
-## Errors that can occur when extracting a ZIP archive.
-##
-## `EntryTooLarge` is an entry that declares more bytes than the caller
-## allows, and `SizeMismatch` one whose content is not the size it declares.
-## `DuplicatePath` is a second entry with a path already in the archive, which
-## different readers resolve differently.
-ExtractError : [
+PrivateExtractError : [
 	InvalidSignature,
 	CompressionNotSupported(U16),
 	CrcMismatch({ path : Str, expected : U32, actual : U32 }),
@@ -129,10 +105,7 @@ ExtractError : [
 ## but can still copy (see [Zip.compressed]).
 Method : [Stored, Deflated, Other(U16)]
 
-## One central-directory record, with its data offset resolved from the local
-## header. The sizes are as declared by the archive, with every ZIP64 value
-## resolved. [Zip.extract_entry] checks the content against them.
-Entry : {
+PrivateEntry : {
 	path : Str,
 	method : Method,
 	crc : U32,
@@ -149,27 +122,68 @@ EntryLimits := {
 	max_bytes : U64 ?? 1_073_741_824,
 }
 
-## An entry's compressed bytes exactly as stored, with the facts needed to
-## write them again. [Zip.compressed] reads one, and [Zip.add] writes it with
-## `Copied`, so the CRC and sizes the writer copies always belong to these
-## bytes.
-Compressed :: { entry : Entry, bytes : List(U8) }
+PrivateCompressed :: { entry : PrivateEntry, bytes : List(U8) }
 
 ## Options for [Zip.writer]. `Zip.writer({})` compresses with `Balanced`.
 WriterOptions := {
-	compression : Compression ?? Balanced,
+	compression : PrivateCompression ?? Balanced,
 }
 
-## An archive being written one entry at a time; see [Zip.writer]. It holds
-## the central directory written so far and the paths already used, never an
-## entry's content.
-Writer :: { compression : Compression, paths : Set(Str), dir : Directory }
+PrivateWriter :: { compression : PrivateCompression, paths : Set(Str), dir : Directory }
 
 # The central directory so far: the records, how many there are, and the
 # archive offset where the next local header goes.
 Directory : { offset : U64, central : List(U8), count : U64 }
 
 Zip := [].{
+
+	## A file entry in the archive.
+	##
+	## The `path` can include directories (e.g. `"foo/bar.txt"`).
+	ZipEntry : PrivateZipEntry
+
+	## How (and whether) [Zip.create] compresses entries.
+	##
+	## `None` stores entries uncompressed. The rest compress with DEFLATE,
+	## trading speed for size, with the levels of
+	## [roc-deflate](https://github.com/niclas-ahden/roc-deflate), a port of libdeflate:
+	## `Fastest` is level 1, the quickest, `Balanced` is level 6, zlib's default
+	## effort, and `Smallest` is level 12, the smallest archive libdeflate makes.
+	##
+	## With anything but `None`, an entry whose compressed form would not be
+	## smaller (e.g. data that is already compressed) is stored uncompressed
+	## instead, as ZIP tools conventionally do.
+	Compression : PrivateCompression
+
+	## Errors that can occur when creating a ZIP archive.
+	##
+	## Paths are compared byte for byte, so `DuplicatePath` names a path that was
+	## already written.
+	CreateError : PrivateCreateError
+
+	## Errors that can occur when extracting a ZIP archive.
+	##
+	## `EntryTooLarge` is an entry that declares more bytes than the caller
+	## allows, and `SizeMismatch` one whose content is not the size it declares.
+	## `DuplicatePath` is a second entry with a path already in the archive, which
+	## different readers resolve differently.
+	ExtractError : PrivateExtractError
+
+	## One central-directory record, with its data offset resolved from the local
+	## header. The sizes are as declared by the archive, with every ZIP64 value
+	## resolved. [Zip.extract_entry] checks the content against them.
+	Entry : PrivateEntry
+
+	## An entry's compressed bytes exactly as stored, with the facts needed to
+	## write them again. [Zip.compressed] reads one, and [Zip.add] writes it with
+	## `Copied`, so the CRC and sizes the writer copies always belong to these
+	## bytes.
+	Compressed : PrivateCompressed
+
+	## An archive being written one entry at a time; see [Zip.writer]. It holds
+	## the central directory written so far and the paths already used, never an
+	## entry's content.
+	Writer : PrivateWriter
 
 	## Create a ZIP archive from a list of entries. Returns the archive as bytes.
 	##
@@ -429,8 +443,8 @@ Zip := [].{
 
 # --- Writing ---
 
-## The roc-deflate level behind each DEFLATE setting of [Compression].
-deflate_level : Compression -> [Store, Level(Deflate.Level)]
+## The roc-deflate level behind each DEFLATE setting of [Zip.Compression].
+deflate_level : Zip.Compression -> [Store, Level(Deflate.Level)]
 deflate_level = |compression|
 	match compression {
 		None => Store
@@ -441,7 +455,7 @@ deflate_level = |compression|
 
 # Check paths in order, as `add` would, so `create` fails before it
 # compresses anything.
-validate_entries : List(ZipEntry) -> Try({}, CreateError)
+validate_entries : List(Zip.ZipEntry) -> Try({}, Zip.CreateError)
 validate_entries = |entries| {
 	var $paths = Set.with_capacity(entries.len())
 	for entry in entries {
@@ -450,7 +464,7 @@ validate_entries = |entries| {
 	Ok({})
 }
 
-check_path : Set(Str), Str -> Try(Set(Str), CreateError)
+check_path : Set(Str), Str -> Try(Set(Str), Zip.CreateError)
 check_path = |paths, path|
 	if path.is_empty() {
 		Err(EmptyPath(path))
@@ -463,14 +477,14 @@ check_path = |paths, path|
 	}
 
 # Every central record, with the largest ZIP64 extra field each could need.
-central_dir_capacity : List(ZipEntry) -> U64
+central_dir_capacity : List(Zip.ZipEntry) -> U64
 central_dir_capacity = |entries|
 	entries.fold(0, |total, entry| total + central_header_len + entry.path.count_utf8_bytes() + 28)
 
 # Stored, an archive's size is known up front, so it is allocated once. A
 # compressed archive starts with room for its headers and grows
 # geometrically as entries are compressed into it.
-initial_archive_capacity : List(ZipEntry), Compression -> U64
+initial_archive_capacity : List(Zip.ZipEntry), Zip.Compression -> U64
 initial_archive_capacity = |entries, compression| {
 	headers = entries.fold(0, |total, entry| total + local_header_len + entry.path.count_utf8_bytes() + 20)
 	data = match compression {
@@ -481,7 +495,7 @@ initial_archive_capacity = |entries, compression| {
 }
 
 # The room an entry's data needs while it is written.
-content_capacity : U64, Compression -> U64
+content_capacity : U64, Zip.Compression -> U64
 content_capacity = |len, compression|
 	match compression {
 		None => len
@@ -499,7 +513,7 @@ reserve_geometric = |list, spare|
 		list.reserve(spare.max(list.len()))
 	}
 
-append_content : Directory, ZipEntry, Compression, List(U8) -> { dir : Directory, out : List(U8) }
+append_content : Directory, Zip.ZipEntry, Zip.Compression, List(U8) -> { dir : Directory, out : List(U8) }
 append_content = |dir, entry, compression, out| {
 	content = entry.content
 	name = entry.path.to_utf8()
@@ -556,7 +570,7 @@ append_content = |dir, entry, compression, out| {
 	}
 }
 
-append_copied : Directory, Compressed, List(U8) -> { dir : Directory, out : List(U8) }
+append_copied : Directory, Zip.Compressed, List(U8) -> { dir : Directory, out : List(U8) }
 append_copied = |dir, copy, out| {
 	entry = copy.entry
 	name = entry.path.to_utf8()
@@ -888,7 +902,7 @@ expect decode_u64_le([0xF0, 0xDE, 0xBC, 0x9A, 0x78, 0x56, 0x34, 0x12], 0) == Ok(
 # the 20 bytes before the classic record belong to the last central record,
 # where a name or extra field can hold the locator's signature by chance or
 # on purpose. A sentinel with no locator is read as the value it is.
-find_central_directory : List(U8) -> Try({ offset : U64, count : U64 }, ExtractError)
+find_central_directory : List(U8) -> Try({ offset : U64, count : U64 }, Zip.ExtractError)
 find_central_directory = |bytes|
 	match find_end_of_central_dir(bytes) {
 		Ok(eocd_offset) => {
@@ -978,7 +992,7 @@ has_zip64_locator = |bytes, eocd_offset|
 # index of the archive. The sizes and CRCs stored here are correct even for
 # streamed archives, whose local headers contain zeros (with the real values
 # in data descriptors after each entry's content).
-read_central_record : List(U8), U64 -> Try({ entry : Entry, next : U64 }, ExtractError)
+read_central_record : List(U8), U64 -> Try({ entry : Zip.Entry, next : U64 }, Zip.ExtractError)
 read_central_record = |bytes, offset| {
 	# Central directory header layout:
 	# 0-3: signature
@@ -1036,7 +1050,7 @@ read_central_record = |bytes, offset| {
 # 32-bit central directory fields holding 0xFFFFFFFF store their real values
 # in a ZIP64 extra field, in order: uncompressed size, compressed size, local
 # header offset — each present only if its 32-bit field overflowed.
-resolve_zip64_values : List(U8), U64, U64, { uncompressed_size : U32, compressed_size : U32, local_header_offset : U32 } -> Try({ uncompressed_size : U64, compressed_size : U64, local_header_offset : U64 }, ExtractError)
+resolve_zip64_values : List(U8), U64, U64, { uncompressed_size : U32, compressed_size : U32, local_header_offset : U32 } -> Try({ uncompressed_size : U64, compressed_size : U64, local_header_offset : U64 }, Zip.ExtractError)
 resolve_zip64_values = |bytes, extra_start, extra_len, fields| {
 	if fields.uncompressed_size != 0xFFFFFFFF and fields.compressed_size != 0xFFFFFFFF and fields.local_header_offset != 0xFFFFFFFF {
 		return Ok({ uncompressed_size: fields.uncompressed_size.to_u64(), compressed_size: fields.compressed_size.to_u64(), local_header_offset: fields.local_header_offset.to_u64() })
@@ -1050,7 +1064,7 @@ resolve_zip64_values = |bytes, extra_start, extra_len, fields| {
 
 # A 32-bit field's real value: itself, or, when it holds the sentinel, the
 # next 64-bit value in the ZIP64 extra field.
-zip64_value : List(U8), U64, U32 -> Try({ value : U64, next : U64 }, ExtractError)
+zip64_value : List(U8), U64, U32 -> Try({ value : U64, next : U64 }, Zip.ExtractError)
 zip64_value = |bytes, at, field|
 	if field == 0xFFFFFFFF {
 		value = decode_u64_le(bytes, at) ? |_| TruncatedArchive
@@ -1078,7 +1092,7 @@ find_zip64_extra_field = |bytes, start, end| {
 # Where an entry's data starts, from the fixed part of its local header. The
 # filename and extra field lengths must come from the local header (they can
 # differ from the central directory copy).
-local_data_offset : List(U8), U64 -> Try(U64, ExtractError)
+local_data_offset : List(U8), U64 -> Try(U64, Zip.ExtractError)
 local_data_offset = |bytes, local_offset| {
 	sig = decode_u32_le(bytes, local_offset) ? |_| TruncatedArchive
 	if sig != local_file_header_sig {
@@ -1090,7 +1104,7 @@ local_data_offset = |bytes, local_offset| {
 }
 
 # An entry's data as the archive stores it, a slice of the archive.
-stored_bytes : List(U8), Entry -> Try(List(U8), ExtractError)
+stored_bytes : List(U8), Zip.Entry -> Try(List(U8), Zip.ExtractError)
 stored_bytes = |bytes, entry|
 	if entry.data_offset.plus_saturated(entry.compressed_size) > bytes.len() {
 		Err(TruncatedArchive)
@@ -1099,7 +1113,7 @@ stored_bytes = |bytes, entry|
 	}
 
 # Inflate into a buffer reserved at the declared size, stopping there.
-inflate : List(U8), Str, U64 -> Try(List(U8), ExtractError)
+inflate : List(U8), Str, U64 -> Try(List(U8), Zip.ExtractError)
 inflate = |data, path, declared| {
 	if declared > data.len().times_saturated(max_inflate_ratio) {
 		return Err(SizeMismatch({ path, declared }))
@@ -1164,7 +1178,7 @@ expect {
 
 # Empty archive round-trip
 expect {
-	original : List(ZipEntry)
+	original : List(Zip.ZipEntry)
 	original = []
 	match Zip.create(original, None) {
 		Ok(zip_bytes) => Zip.extract(zip_bytes) == Ok(original)
@@ -1570,7 +1584,7 @@ test_archives = {
 
 # Distinct paths, an empty entry, bytes that do not compress, a UTF-8 name,
 # and text that compresses differently at every level.
-sample_entries : List(ZipEntry)
+sample_entries : List(Zip.ZipEntry)
 sample_entries = [
 	{ path: "hello.txt", content: "Hello, World!".to_utf8() },
 	{ path: "docs/readme.md", content: "# Readme".to_utf8() },
@@ -1869,7 +1883,7 @@ expect {
 	)
 }
 
-archive_data : List(U8), Entry -> List(U8)
+archive_data : List(U8), Zip.Entry -> List(U8)
 archive_data = |archive, entry| archive.sublist({ start: entry.data_offset, len: entry.compressed_size })
 
 # An entry this package cannot inflate passes through unchanged.
