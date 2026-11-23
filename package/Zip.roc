@@ -8,6 +8,8 @@
 ## the index with [Zip.entries], then take each entry with
 ## [Zip.extract_entry] (inflated, within a size limit) or [Zip.compressed]
 ## (as stored). [Zip.writer] writes an archive one entry at a time.
+## [Zip.create_items] records a Unix mode and a modification time for each
+## file and directory, so programs keep their execute bits when extracted.
 import crc32.Crc32
 import deflate.Deflate
 
@@ -52,6 +54,31 @@ gp_flag_utf8 = 0x0800
 # an all-zero date field is invalid).
 dos_date_1980_01_01 : U16
 dos_date_1980_01_01 = 0x0021
+
+# The high byte of "version made by" names the system whose file attributes
+# the external attributes field holds: 0 is MS-DOS, 3 is Unix, 19 is OS X.
+host_msdos : U16
+host_msdos = 0
+
+host_unix : U16
+host_unix = 3
+
+host_osx : U16
+host_osx = 19
+
+# Unix file type bits, from <sys/stat.h>, and the permission bits beside them.
+s_ifreg : U16
+s_ifreg = 0o100000
+
+s_ifdir : U16
+s_ifdir = 0o040000
+
+permission_bits : U16
+permission_bits = 0o7777
+
+# The MS-DOS directory attribute, in the low byte of the external attributes.
+msdos_directory : U32
+msdos_directory = 0x10
 
 # Fixed record sizes, before any variable-length name, extra field or comment.
 local_header_len : U64
@@ -138,6 +165,9 @@ Zip := [].{
 	## One central-directory record, with its data offset resolved from the local
 	## header. The sizes are as declared by the archive, with every ZIP64 value
 	## resolved. [Zip.extract_entry] checks the content against them.
+	##
+	## `mode` is the Unix mode when the record says it was made on Unix (or OS X),
+	## and `modified` the time in its central header.
 	Entry : {
 		path : Str,
 		method : Method,
@@ -145,6 +175,8 @@ Zip := [].{
 		compressed_size : U64,
 		uncompressed_size : U64,
 		data_offset : U64,
+		mode : UnixMode,
+		modified : DosTime,
 	}
 
 	## Bounds for [Zip.extract_entry]. `Zip.extract_entry(bytes, entry, {})`
@@ -171,6 +203,64 @@ Zip := [].{
 	## entry's content.
 	Writer :: { compression : Compression, paths : Set(Str), dir : Directory }
 
+	## A modification time as a ZIP header records it: the MS-DOS date and time
+	## fields, in local time with no zone, to two seconds, from 1980 to 2107.
+	## [Zip.dos_time] makes one from seconds since the Unix epoch.
+	##
+	## `date` is `(year - 1980) << 9 | month << 5 | day` and `time` is
+	## `hour << 11 | minute << 5 | second / 2`. `{ date: 0x0021, time: 0 }` is
+	## 1980-01-01 00:00:00, which is what entries record unless they are given a
+	## time.
+	DosTime : { date : U16, time : U16 }
+
+	## An entry's Unix mode. The writer takes the permission bits, such as
+	## `Unix(0o755)`, and adds the file type itself. The reader reports the whole
+	## `st_mode`, type bits included, so a file written with `Unix(0o755)` reads
+	## back as `Unix(0o100755)`.
+	##
+	## `NotRecorded` writes no Unix mode, as [Zip.create] does: the entry is
+	## marked as made on MS-DOS, and readers fall back to their own default
+	## permissions. Reading, it means the archive did not record one.
+	UnixMode : [Unix(U16), NotRecorded]
+
+	## A file with its metadata, for [Zip.create_items] and [Zip.add]. Only
+	## `path` and `content` are required:
+	##
+	## ```roc
+	## Zip.add(writer, File({ path: "MyApp.app/Contents/MacOS/MyApp", content: program, mode: Unix(0o755) }))
+	## ```
+	##
+	## A record literal gets the defaults where Roc knows it is a `FileEntry`, so
+	## one built in a lambda needs an annotation, such as a helper returning
+	## [Zip.Item].
+	FileEntry := {
+		path : Str,
+		content : List(U8),
+
+		## The permission bits. With `Unix(bits)` the entry is marked as made on
+		## Unix, and its external attributes hold `S_IFREG | bits` in their high
+		## 16 bits, which unzip, bsdtar, ditto and Archive Utility restore.
+		mode : UnixMode ?? NotRecorded,
+
+		## Recorded in both the local and the central header.
+		modified : DosTime ?? { date: 0x0021, time: 0 },
+	}
+
+	## A directory, for [Zip.create_items] and [Zip.add]. It is written as an
+	## empty stored entry named `path` with a `/` appended if it does not end in
+	## one, and with the MS-DOS directory attribute set.
+	DirectoryEntry := {
+		path : Str,
+
+		## The permission bits. With `Unix(bits)` the external attributes also
+		## hold `S_IFDIR | bits` in their high 16 bits.
+		mode : UnixMode ?? NotRecorded,
+		modified : DosTime ?? { date: 0x0021, time: 0 },
+	}
+
+	## One entry for [Zip.create_items]: a file or a directory, with metadata.
+	Item : [File(FileEntry), Directory(DirectoryEntry)]
+
 	## Create a ZIP archive from a list of entries. Returns the archive as bytes.
 	##
 	## The `Compression` argument decides whether entries are stored as-is
@@ -190,18 +280,27 @@ Zip := [].{
 	##
 	## The output depends only on the entries, their order and the
 	## compression: timestamps are zeroed, and there are no data descriptors.
+	## No Unix mode is recorded; [Zip.create_items] records one.
 	create : List(ZipEntry), Compression -> Try(List(U8), CreateError)
-	create = |files, compression| {
-		validate_entries(files)?
-		var $dir = { offset: 0, central: List.with_capacity(central_dir_capacity(files)), count: 0 }
-		var $out = List.with_capacity(initial_archive_capacity(files, compression))
-		for entry in files {
-			written = append_content($dir, entry, compression, $out)
-			$dir = written.dir
-			$out = written.out
-		}
-		Ok(finish_into($dir, $out))
-	}
+	create = |files, compression| create_pending(files.map(content_pending), compression)
+
+	## Create a ZIP archive from files and directories with metadata: a Unix
+	## mode and a modification time per entry (see [Zip.FileEntry] and
+	## [Zip.DirectoryEntry]).
+	##
+	## ```roc
+	## Zip.create_items([
+	## 	Directory({ path: "MyApp.app/", mode: Unix(0o755) }),
+	## 	Directory({ path: "MyApp.app/Contents/", mode: Unix(0o755) }),
+	## 	File({ path: "MyApp.app/Contents/Info.plist", content: plist, mode: Unix(0o644) }),
+	## ], Balanced)
+	## ```
+	##
+	## Entries are written in the order given, and the output depends only on
+	## them and the compression, as with [Zip.create]. An item with neither a
+	## mode nor a time is written exactly as [Zip.create] writes the same file.
+	create_items : List(Zip.Item), Compression -> Try(List(U8), CreateError)
+	create_items = |items, compression| create_pending(items.map(item_pending), compression)
 
 	## Extract entries from a ZIP archive.
 	##
@@ -371,23 +470,32 @@ Zip := [].{
 	}
 
 	## Write one entry: its local header, name, extra field and data, as one
-	## chunk. A `Content` entry is compressed whole with the writer's
-	## compression, falling back to store, and its CRC and sizes are known
-	## before its header is written, so the archive has no data descriptors. A
-	## `Copied` entry keeps the method, CRC, sizes and bytes it was read with.
-	add : Writer, [Content(ZipEntry), Copied(Compressed)] -> Try({ writer : Writer, chunk : List(U8) }, CreateError)
+	## chunk. A `Content` or `File` entry is compressed whole with the
+	## writer's compression, falling back to store, and its CRC and sizes are
+	## known before its header is written, so the archive has no data
+	## descriptors. A `Directory` is stored empty. `File` and `Directory`
+	## carry a Unix mode and a time, as in [Zip.create_items]. A `Copied`
+	## entry keeps the method, CRC, sizes and bytes it was read with, but not
+	## its mode or time, which are written as for `Content`.
+	add : Writer, [Content(ZipEntry), Copied(Compressed), File(Zip.FileEntry), Directory(Zip.DirectoryEntry)] -> Try({ writer : Writer, chunk : List(U8) }, CreateError)
 	add = |w, item| {
-		path = match item {
-			Content(entry) => entry.path
-			Copied(copy) => copy.entry.path
+		source = match item {
+			Content(entry) => Fresh(content_pending(entry))
+			File(file) => Fresh(file_pending(file))
+			Directory(directory) => Fresh(directory_pending(directory))
+			Copied(copy) => Copy(copy)
+		}
+		path = match source {
+			Fresh(entry) => entry.path
+			Copy(copy) => copy.entry.path
 		}
 		paths = check_path(w.paths, path)?
-		written = match item {
-			Content(entry) => {
+		written = match source {
+			Fresh(entry) => {
 				capacity = local_header_len + path.count_utf8_bytes() + 20 + content_capacity(entry.content.len(), w.compression)
 				append_content(w.dir, entry, w.compression, List.with_capacity(capacity))
 			}
-			Copied(copy) => append_copied(w.dir, copy, [])
+			Copy(copy) => append_copied(w.dir, copy, [])
 		}
 		Ok({
 			writer: { compression: w.compression, paths, dir: written.dir },
@@ -401,6 +509,30 @@ Zip := [].{
 	finish = |w| {
 		dir = w.dir
 		finish_into(dir, List.with_capacity(dir.central.len() + zip64_end_len + end_of_central_dir_len))
+	}
+
+	## The [Zip.DosTime] of `seconds` after the Unix epoch, in UTC, for an
+	## entry's `modified` field (for example from `SOURCE_DATE_EPOCH`). A ZIP
+	## header records two-second steps from 1980 to 2107, so an odd second
+	## rounds down, and a time outside that range is its nearest end.
+	##
+	## ```roc
+	## Zip.dos_time(0) # { date: 0x0021, time: 0 }, 1980-01-01 00:00:00
+	## Zip.dos_time(1_700_000_000) # 2023-11-14 22:13:20
+	## ```
+	dos_time : U64 -> Zip.DosTime
+	dos_time = |seconds| {
+		# 1980-01-01 00:00:00 and 2107-12-31 23:59:58 UTC.
+		at = seconds.max(315_532_800).min(4_354_819_198)
+		{ year, month, day } = civil_from_days(at // 86_400)
+		of_day = at % 86_400
+		hour = of_day // 3600
+		minute = (of_day % 3600) // 60
+		second = of_day % 60
+		{
+			date: ((year - 1980).shl_wrap(9) + month.shl_wrap(5) + day).to_u16_wrap(),
+			time: (hour.shl_wrap(11) + minute.shl_wrap(5) + second // 2).to_u16_wrap(),
+		}
 	}
 
 	## Whether an entry path is safe to join onto an extraction directory.
@@ -439,12 +571,80 @@ deflate_level = |compression|
 		Smallest => Level(12)
 	}
 
+# An entry about to be written: its stored path, content, and the metadata
+# its headers record.
+Pending : { path : Str, content : List(U8), meta : Meta }
+
+# The "version made by" host, the external file attributes, and the
+# modification time.
+Meta : { host : U16, external : U32, modified : Zip.DosTime }
+
+# What Zip.create has always written: made on MS-DOS, no attributes, 1980.
+content_meta : Meta
+content_meta = { host: host_msdos, external: 0, modified: { date: dos_date_1980_01_01, time: 0 } }
+
+content_pending : Zip.ZipEntry -> Pending
+content_pending = |entry| { path: entry.path, content: entry.content, meta: content_meta }
+
+item_pending : Zip.Item -> Pending
+item_pending = |item|
+	match item {
+		File(file) => file_pending(file)
+		Directory(directory) => directory_pending(directory)
+	}
+
+file_pending : Zip.FileEntry -> Pending
+file_pending = |file| {
+	path: file.path,
+	content: file.content,
+	meta: mode_meta(file.mode, s_ifreg, 0, file.modified),
+}
+
+# A directory's name ends in `/`. An empty path stays empty, so it fails as
+# `EmptyPath` rather than naming the root.
+directory_pending : Zip.DirectoryEntry -> Pending
+directory_pending = |directory| {
+	path: if directory.path.is_empty() or directory.path.ends_with("/") {
+		directory.path
+	} else {
+		"${directory.path}/"
+	},
+	content: [],
+	meta: mode_meta(directory.mode, s_ifdir, msdos_directory, directory.modified),
+}
+
+# With a Unix mode, the entry is made on Unix and the mode, with its file
+# type, fills the high 16 bits of the external attributes. The low 16 bits
+# keep the MS-DOS attributes either way.
+mode_meta : Zip.UnixMode, U16, U32, Zip.DosTime -> Meta
+mode_meta = |mode, file_type, dos_attributes, modified|
+	match mode {
+		Unix(bits) => {
+			unix = file_type.bitwise_or(bits.bitwise_and(permission_bits))
+			{ host: host_unix, external: unix.to_u32().shl_wrap(16).bitwise_or(dos_attributes), modified }
+		}
+		NotRecorded => { host: host_msdos, external: dos_attributes, modified }
+	}
+
+create_pending : List(Pending), Zip.Compression -> Try(List(U8), Zip.CreateError)
+create_pending = |pending, compression| {
+	validate_entries(pending)?
+	var $dir = { offset: 0, central: List.with_capacity(central_dir_capacity(pending)), count: 0 }
+	var $out = List.with_capacity(initial_archive_capacity(pending, compression))
+	for entry in pending {
+		written = append_content($dir, entry, compression, $out)
+		$dir = written.dir
+		$out = written.out
+	}
+	Ok(finish_into($dir, $out))
+}
+
 # Check paths in order, as `add` would, so `create` fails before it
 # compresses anything.
-validate_entries : List(Zip.ZipEntry) -> Try({}, Zip.CreateError)
-validate_entries = |entries| {
-	var $paths = Set.with_capacity(entries.len())
-	for entry in entries {
+validate_entries : List(Pending) -> Try({}, Zip.CreateError)
+validate_entries = |pending| {
+	var $paths = Set.with_capacity(pending.len())
+	for entry in pending {
 		$paths = check_path($paths, entry.path)?
 	}
 	Ok({})
@@ -463,14 +663,14 @@ check_path = |paths, path|
 	}
 
 # Every central record, with the largest ZIP64 extra field each could need.
-central_dir_capacity : List(Zip.ZipEntry) -> U64
+central_dir_capacity : List(Pending) -> U64
 central_dir_capacity = |entries|
 	entries.fold(0, |total, entry| total + central_header_len + entry.path.count_utf8_bytes() + 28)
 
 # Stored, an archive's size is known up front, so it is allocated once. A
 # compressed archive starts with room for its headers and grows
 # geometrically as entries are compressed into it.
-initial_archive_capacity : List(Zip.ZipEntry), Zip.Compression -> U64
+initial_archive_capacity : List(Pending), Zip.Compression -> U64
 initial_archive_capacity = |entries, compression| {
 	headers = entries.fold(0, |total, entry| total + local_header_len + entry.path.count_utf8_bytes() + 20)
 	data = match compression {
@@ -499,16 +699,25 @@ reserve_geometric = |list, spare|
 		list.reserve(spare.max(list.len()))
 	}
 
-append_content : Directory, Zip.ZipEntry, Zip.Compression, List(U8) -> { dir : Directory, out : List(U8) }
+append_content : Directory, Pending, Zip.Compression, List(U8) -> { dir : Directory, out : List(U8) }
 append_content = |dir, entry, compression, out| {
 	content = entry.content
+	meta = entry.meta
 	name = entry.path.to_utf8()
 	crc = Crc32.checksum(content)
 	len = content.len()
 	start = out.len()
-	match deflate_level(compression) {
+	# Empty content never deflates smaller, and storing it straight away
+	# writes the bytes the fallback below would, without starting a
+	# compressor.
+	effort = if len == 0 {
+		Store
+	} else {
+		deflate_level(compression)
+	}
+	match effort {
 		Store => {
-			header = { name, crc, method: compression_method_store, compressed_len: len, uncompressed_len: len }
+			header = { name, crc, method: compression_method_store, compressed_len: len, uncompressed_len: len, meta }
 			data_start = local_header_len + name.len() + local_extra_len(len, len)
 			with_header = append_local_header(reserve_geometric(out, data_start + len), header)
 			appended = with_header.append_sublist(content, { start: 0, len })
@@ -523,7 +732,7 @@ append_content = |dir, entry, compression, out| {
 			zip64 = len >= 0xFFFFFFFF
 			data_start = start + local_header_len + name.len() + local_extra_len(len, len)
 			reserved = reserve_geometric(out, data_start - start + Deflate.compress_bound(len))
-			with_header = append_local_header(reserved, { name, crc, method: compression_method_deflate, compressed_len: 0, uncompressed_len: len })
+			with_header = append_local_header(reserved, { name, crc, method: compression_method_deflate, compressed_len: 0, uncompressed_len: len, meta })
 			deflated = Deflate.compress_into(content, level, with_header)
 			deflated_len = deflated.len() - data_start
 			# The compressed size sits in the 32-bit field, or after the
@@ -534,7 +743,7 @@ append_content = |dir, entry, compression, out| {
 				start + 18
 			}
 			if deflated_len < len {
-				header = { name, crc, method: compression_method_deflate, compressed_len: deflated_len, uncompressed_len: len }
+				header = { name, crc, method: compression_method_deflate, compressed_len: deflated_len, uncompressed_len: len, meta }
 				patched = if zip64 {
 					set_u64_le(deflated, size_at, deflated_len)
 				} else {
@@ -542,7 +751,7 @@ append_content = |dir, entry, compression, out| {
 				}
 				{ dir: add_central_record(dir, header, patched.len() - start), out: patched }
 			} else {
-				header = { name, crc, method: compression_method_store, compressed_len: len, uncompressed_len: len }
+				header = { name, crc, method: compression_method_store, compressed_len: len, uncompressed_len: len, meta }
 				stored = deflated.take_first(data_start).append_sublist(content, { start: 0, len })
 				with_method = set_u16_le(stored, start + 8, compression_method_store)
 				patched = if zip64 {
@@ -566,6 +775,7 @@ append_copied = |dir, copy, out| {
 		method: method_code(entry.method),
 		compressed_len: entry.compressed_size,
 		uncompressed_len: entry.uncompressed_size,
+		meta: content_meta,
 	}
 	data_len = copy.bytes.len()
 	record_len = local_header_len + name.len() + local_extra_len(header.uncompressed_len, header.compressed_len) + data_len
@@ -593,7 +803,7 @@ method_from_code = |code|
 	}
 
 # What a local and a central header both record about an entry.
-Header : { name : List(U8), crc : U32, method : U16, compressed_len : U64, uncompressed_len : U64 }
+Header : { name : List(U8), crc : U32, method : U16, compressed_len : U64, uncompressed_len : U64, meta : Meta }
 
 # In the local header, if either size overflows, both 32-bit size fields get
 # the sentinel and the ZIP64 extra field must hold both sizes.
@@ -622,8 +832,8 @@ append_local_header = |out, header| {
 		)
 		|> put_u16(gp_flag_utf8) # General purpose bit flag
 		|> put_u16(header.method)
-		|> put_u16(0) # Last mod time
-		|> put_u16(dos_date_1980_01_01) # Last mod date
+		|> put_u16(header.meta.modified.time) # Last mod time
+		|> put_u16(header.meta.modified.date) # Last mod date
 		|> put_u32(header.crc)
 	# Compressed then uncompressed size; with ZIP64 both real values live
 	# in the extra field
@@ -678,12 +888,12 @@ add_central_record = |dir, header, record_len| {
 	}
 	with_fixed = reserve_geometric(dir.central, central_header_len + header.name.len() + extra_len)
 		|> put_u32(central_dir_header_sig)
-		|> put_u16(version) # Version made by
+		|> put_u16(header.meta.host.shl_wrap(8).bitwise_or(version)) # Version made by
 		|> put_u16(version) # Version needed to extract
 		|> put_u16(gp_flag_utf8) # General purpose bit flag
 		|> put_u16(header.method)
-		|> put_u16(0) # Last mod time
-		|> put_u16(dos_date_1980_01_01) # Last mod date
+		|> put_u16(header.meta.modified.time) # Last mod time
+		|> put_u16(header.meta.modified.date) # Last mod date
 		|> put_u32(header.crc)
 		|> put_zip64_u32(c) # Compressed size
 		|> put_zip64_u32(u) # Uncompressed size
@@ -692,7 +902,7 @@ add_central_record = |dir, header, record_len| {
 		|> put_u16(0) # File comment length
 		|> put_u16(0) # Disk number start
 		|> put_u16(0) # Internal file attributes
-		|> put_u32(0) # External file attributes
+		|> put_u32(header.meta.external) # External file attributes
 		|> put_zip64_u32(offset) # Relative offset of local header
 		.append_sublist(header.name, { start: 0, len: header.name.len() })
 	central =
@@ -982,26 +1192,34 @@ read_central_record : List(U8), U64 -> Try({ entry : Zip.Entry, next : U64 }, Zi
 read_central_record = |bytes, offset| {
 	# Central directory header layout:
 	# 0-3: signature
+	# 4-5: version made by, its high byte the host system
 	# 10-11: compression method
+	# 12-13: last mod time
+	# 14-15: last mod date
 	# 16-19: crc32
 	# 20-23: compressed size
 	# 24-27: uncompressed size
 	# 28-29: filename length
 	# 30-31: extra field length
 	# 32-33: comment length
+	# 38-41: external file attributes, the Unix mode in the high 16 bits
 	# 42-45: offset of local header
 	# 46+: filename, extra field, comment
 	sig = decode_u32_le(bytes, offset) ? |_| TruncatedArchive
 	if sig != central_dir_header_sig {
 		return Err(InvalidSignature)
 	}
+	made_by = decode_u16_le(bytes, offset + 4) ? |_| TruncatedArchive
 	method = decode_u16_le(bytes, offset + 10) ? |_| TruncatedArchive
+	time = decode_u16_le(bytes, offset + 12) ? |_| TruncatedArchive
+	date = decode_u16_le(bytes, offset + 14) ? |_| TruncatedArchive
 	crc = decode_u32_le(bytes, offset + 16) ? |_| TruncatedArchive
 	compressed_size = decode_u32_le(bytes, offset + 20) ? |_| TruncatedArchive
 	uncompressed_size = decode_u32_le(bytes, offset + 24) ? |_| TruncatedArchive
 	filename_len = decode_u16_le(bytes, offset + 28) ? |_| TruncatedArchive
 	extra_len = decode_u16_le(bytes, offset + 30) ? |_| TruncatedArchive
 	comment_len = decode_u16_le(bytes, offset + 32) ? |_| TruncatedArchive
+	external = decode_u32_le(bytes, offset + 38) ? |_| TruncatedArchive
 	local_header_offset = decode_u32_le(bytes, offset + 42) ? |_| TruncatedArchive
 
 	name_start = offset + central_header_len
@@ -1028,9 +1246,49 @@ read_central_record = |bytes, offset| {
 			compressed_size: resolved.compressed_size,
 			uncompressed_size: resolved.uncompressed_size,
 			data_offset,
+			mode: unix_mode(made_by, external),
+			modified: { date, time },
 		},
 		next: name_start + filename_len.to_u64() + extra_len.to_u64() + comment_len.to_u64(),
 	})
+}
+
+# The Unix mode a record made on Unix or OS X keeps in the high 16 bits of its
+# external attributes.
+unix_mode : U16, U32 -> Zip.UnixMode
+unix_mode = |made_by, external| {
+	host = made_by.shr_zf_wrap(8)
+	if host == host_unix or host == host_osx {
+		Unix(external.shr_zf_wrap(16).to_u16_wrap())
+	} else {
+		NotRecorded
+	}
+}
+
+# The year, month and day of a count of days since 1970-01-01, for days on
+# or after it (Howard Hinnant's `civil_from_days`).
+civil_from_days : U64 -> { year : U64, month : U64, day : U64 }
+civil_from_days = |days| {
+	z = days + 719_468
+	era = z // 146_097
+	doe = z - era * 146_097
+	yoe = (doe - doe // 1460 + doe // 36_524 - doe // 146_096) // 365
+	doy = doe - (365 * yoe + yoe // 4 - yoe // 100)
+	mp = (5 * doy + 2) // 153
+	day = doy - (153 * mp + 2) // 5 + 1
+	month = if mp < 10 {
+		mp + 3
+	} else {
+		mp - 9
+	}
+	year = yoe + era * 400 + (
+		if month <= 2 {
+			1
+		} else {
+			0
+		}
+	)
+	{ year, month, day }
 }
 
 # 32-bit central directory fields holding 0xFFFFFFFF store their real values
@@ -1274,7 +1532,7 @@ expect {
 # field with the real sizes in its local header
 expect {
 	four_gb = 0x100000000
-	header = append_local_header([], { name: [0x78], crc: 0, method: compression_method_store, compressed_len: four_gb, uncompressed_len: four_gb })
+	header = append_local_header([], { name: [0x78], crc: 0, method: compression_method_store, compressed_len: four_gb, uncompressed_len: four_gb, meta: content_meta })
 	version_ok = header.sublist({ start: 4, len: 2 }) == [45, 0]
 	sizes_ok = header.sublist({ start: 18, len: 8 }) == List.repeat(0xFF, 8)
 	extra_len_ok = header.sublist({ start: 28, len: 2 }) == [20, 0]
@@ -1293,7 +1551,7 @@ expect {
 # central directory header, with the real offset in a ZIP64 extra field
 expect {
 	four_gb = 0x100000000
-	dir = add_central_record({ offset: four_gb, central: [], count: 0 }, { name: [0x78], crc: 0, method: compression_method_store, compressed_len: 5, uncompressed_len: 5 }, 36)
+	dir = add_central_record({ offset: four_gb, central: [], count: 0 }, { name: [0x78], crc: 0, method: compression_method_store, compressed_len: 5, uncompressed_len: 5, meta: content_meta }, 36)
 	header = dir.central
 	offset_ok = header.sublist({ start: 42, len: 4 }) == List.repeat(0xFF, 4)
 	next_ok = dir.offset == four_gb + 36 and dir.count == 1
@@ -1830,6 +2088,174 @@ expect {
 	added = Zip.add(Zip.writer({}), Content(entry)) ?? crash "the first entry is valid"
 	Zip.add(added.writer, Content(entry)).is_err()
 		and Zip.create([entry, { path: "b.txt", content: [] }, entry], None) == Err(DuplicatePath("a.txt"))
+}
+
+# Unix mode and time tests
+
+# An app bundle's worth of items, out of path order on purpose: a directory
+# without its slash, a program, a plain file and an empty file, each with its
+# own time.
+app_items : List(Zip.Item)
+app_items = [
+	Directory({ path: "My.app", mode: Unix(0o755), modified: Zip.dos_time(1_700_000_000) }),
+	File({ path: "My.app/Contents/MacOS/My", content: word_salad(500), mode: Unix(0o755), modified: Zip.dos_time(1_700_000_002) }),
+	File({ path: "My.app/Contents/Info.plist", content: "<plist/>".to_utf8(), mode: Unix(0o644) }),
+	Directory({ path: "My.app/Contents/Resources/" }),
+	File({ path: "My.app/Contents/PkgInfo", content: [] }),
+]
+
+# Every item reads back with its path, order, mode, time and content, at
+# every compression.
+expect {
+	[None, Fastest, Balanced, Smallest].all(
+		|compression|
+			match Zip.create_items(app_items, compression) {
+				Ok(archive) =>
+					match (Zip.entries(archive), Zip.extract(archive)) {
+						(Ok(index), Ok(extracted)) =>
+							index.map(|entry| entry.path) == ["My.app/", "My.app/Contents/MacOS/My", "My.app/Contents/Info.plist", "My.app/Contents/Resources/", "My.app/Contents/PkgInfo"]
+								and index.map(|entry| entry.mode) == [Unix(0o040755), Unix(0o100755), Unix(0o100644), NotRecorded, NotRecorded]
+								and index.map(|entry| entry.modified) == [Zip.dos_time(1_700_000_000), Zip.dos_time(1_700_000_002), Zip.dos_time(0), Zip.dos_time(0), Zip.dos_time(0)]
+								and extracted.map(|entry| entry.content) == [[], word_salad(500), "<plist/>".to_utf8(), [], []]
+						_ => Bool.False
+					}
+				Err(_) => Bool.False
+			},
+	)
+}
+
+# The central header of a file with a mode: made on Unix, S_IFREG | 0755 in
+# the high 16 bits of the external attributes, and its time in both headers.
+expect {
+	modified = { date: 0x5B6E, time: 0xB1AA }
+	archive = Zip.create_items([File({ path: "x", content: [1], mode: Unix(0o755), modified })], None) ?? []
+	# Local header (30) + name (1) + content (1)
+	central = 32
+	archive.sublist({ start: 10, len: 4 }) == [0xAA, 0xB1, 0x6E, 0x5B]
+		and archive.sublist({ start: central + 4, len: 2 }) == [20, 3]
+		and archive.sublist({ start: central + 12, len: 4 }) == [0xAA, 0xB1, 0x6E, 0x5B]
+		and decode_u32_le(archive, central + 38) == Ok(0x81ED0000)
+}
+
+# A directory is an empty stored entry whose name ends in one slash, with the
+# MS-DOS directory bit, and S_IFDIR | its permissions when it has a mode.
+expect {
+	archive = Zip.create_items([Directory({ path: "d", mode: Unix(0o750) }), Directory({ path: "e/" })], Balanced) ?? []
+	match Zip.entries(archive) {
+		Ok([d, e]) => {
+			# Local header (30) + "d/" (2); then local header (30) + "e/" (2)
+			central = 64
+			second = central + central_header_len + 2
+			d.path == "d/"
+				and e.path == "e/"
+				and d.method == Stored
+				and d.compressed_size == 0
+				and d.uncompressed_size == 0
+				and decode_u32_le(archive, central + 38) == Ok(0x41E80010)
+				and decode_u16_le(archive, central + 4) == Ok(0x0314)
+				and decode_u32_le(archive, second + 38) == Ok(0x00000010)
+				and decode_u16_le(archive, second + 4) == Ok(0x0014)
+		}
+		_ => Bool.False
+	}
+}
+
+# Only permission bits are taken from a mode: the file type comes from the
+# item, so a file given a directory's mode is still a regular file.
+expect {
+	archive = Zip.create_items([File({ path: "f", content: [], mode: Unix(0o040755) }), File({ path: "g", content: [], mode: Unix(0o104755) })], None) ?? []
+	match Zip.entries(archive) {
+		Ok(index) => index.map(|entry| entry.mode) == [Unix(0o100755), Unix(0o104755)]
+		Err(_) => Bool.False
+	}
+}
+
+# Items with neither a mode nor a time are the bytes Zip.create writes.
+expect {
+	items : List(Zip.Item)
+	items = sample_entries.map(|entry| File({ path: entry.path, content: entry.content }))
+	[None, Fastest, Balanced, Smallest].all(|compression| Zip.create_items(items, compression) == Zip.create(sample_entries, compression))
+}
+
+# Zip.create records no mode, and the same time as ever.
+expect {
+	archive = Zip.create(sample_entries, Balanced) ?? []
+	match Zip.entries(archive) {
+		Ok(index) => index.all(|entry| entry.mode == NotRecorded and entry.modified == { date: 0x0021, time: 0 })
+		Err(_) => Bool.False
+	}
+}
+
+# The same items give the same bytes, and the writer's chunks are what
+# create_items returns.
+expect {
+	[None, Balanced].all(
+		|compression| {
+			var $writer = Zip.writer({ compression: compression })
+			var $chunks = []
+			for item in app_items {
+				added = match item {
+					File(file) => Zip.add($writer, File(file))
+					Directory(directory) => Zip.add($writer, Directory(directory))
+				}
+				match added {
+					Ok(next) => {
+						$writer = next.writer
+						$chunks = $chunks.concat(next.chunk)
+					}
+					Err(_) => {}
+				}
+			}
+			created = Zip.create_items(app_items, compression)
+			created == Ok($chunks.concat(Zip.finish($writer))) and Zip.create_items(app_items, compression) == created
+		},
+	)
+}
+
+# A directory's path is checked with its slash, so `d` and `d/` collide, and
+# an empty one is still empty.
+expect {
+	Zip.create_items([Directory({ path: "d" }), Directory({ path: "d/" })], None) == Err(DuplicatePath("d/"))
+		and Zip.create_items([File({ path: "d/", content: [] }), Directory({ path: "d" })], None) == Err(DuplicatePath("d/"))
+		and Zip.create_items([Directory({ path: "" })], None) == Err(EmptyPath(""))
+}
+
+# Modes and times recorded by other tools: Info-ZIP's and bsdtar's archives
+# were made on Unix.
+expect {
+	infozip = Zip.entries(infozip_store_fixture) ?? []
+	bsdtar = Zip.entries(bsdtar_zip64_fixture) ?? []
+	infozip.map(|entry| entry.mode) == [Unix(0o100644), Unix(0o040755), Unix(0o100644)]
+		and infozip.map(|entry| entry.modified) == List.repeat({ date: 0x5CE7, time: 0xBDE3 }, 3)
+		and bsdtar.map(|entry| entry.mode) == [Unix(0o100644)]
+}
+
+# A copied entry keeps its bytes but not its mode or time.
+expect {
+	archive = Zip.create_items(app_items, Balanced) ?? []
+	match copy_archive(archive) {
+		Ok(copy) =>
+			match Zip.entries(copy) {
+				Ok(index) => index.all(|entry| entry.mode == NotRecorded and entry.modified == { date: 0x0021, time: 0 })
+				Err(_) => Bool.False
+			}
+		Err(_) => Bool.False
+	}
+}
+
+# DOS times: the epoch and before it are 1980-01-01, then an ordinary time, a
+# leap day whose odd second rounds down, and the last time a header holds.
+expect Zip.dos_time(0) == { date: 0x0021, time: 0 }
+expect Zip.dos_time(315_532_800) == { date: 0x0021, time: 0 }
+expect Zip.dos_time(1_700_000_000) == dos(2023, 11, 14, 22, 13, 20)
+expect Zip.dos_time(951_827_697) == dos(2000, 2, 29, 12, 34, 56)
+expect Zip.dos_time(U64.highest) == dos(2107, 12, 31, 23, 59, 58)
+
+# The DOS time of a date and a time of day, for tests.
+dos : U16, U16, U16, U16, U16, U16 -> Zip.DosTime
+dos = |year, month, day, hour, minute, second| {
+	date: (year - 1980).shl_wrap(9) + month.shl_wrap(5) + day,
+	time: hour.shl_wrap(11) + minute.shl_wrap(5) + second // 2,
 }
 
 # Copying tests

@@ -7,7 +7,8 @@ Create and extract ZIP archives in Roc.
 - For archives from untrusted sources, `Zip.entries` lists the central directory without inflating anything, and `Zip.extract_entry` inflates one entry within a size limit. An entry that declares more than the limit fails before anything is allocated for it, and a stream that runs past its declared size stops there.
 - `Zip.compressed` takes an entry's bytes exactly as stored, so `Zip.add` can copy it into another archive without inflating or recompressing it.
 - `Zip.writer`, `Zip.add` and `Zip.finish` write an archive one entry at a time. Each call returns the next chunk, which can go straight to a file. The chunks add up to the bytes `Zip.create` returns.
-- Output is deterministic: entries keep their order, timestamps are zeroed, and there are no data descriptors. Repeated paths are refused by the writer and rejected by the reader, since different readers resolve them differently.
+- `Zip.create_items` (and `Zip.add` with `File` and `Directory`) records a Unix mode and a modification time per entry, and writes explicit directory entries, so an executable extracts as executable with unzip, bsdtar, ditto and Archive Utility, whichever system wrote the archive. `Zip.entries` reads both back.
+- Output is deterministic: entries keep their order, timestamps are zeroed unless you set them, and there are no data descriptors. Repeated paths are refused by the writer and rejected by the reader, since different readers resolve them differently.
 - Supports ZIP64, so files and archives larger than 4 GB work.
 - Compression comes from [roc-deflate](https://github.com/niclas-ahden/roc-deflate), a pure-Roc DEFLATE implementation. Use that package directly if you need raw DEFLATE streams (gzip, PNG, etc.) without the ZIP container.
 
@@ -52,6 +53,23 @@ main! = |args| {
 ```
 
 See [examples](examples/) for a runnable program.
+
+## Unix modes and times
+
+`Zip.create` records no permissions, so extracting tools fall back to their defaults and a program loses its execute bit. To keep it, give each entry a mode with `Zip.create_items`:
+
+```roc
+# Seconds since the Unix epoch, for example from SOURCE_DATE_EPOCH
+modified = Zip.dos_time(1_700_000_000)
+
+Zip.create_items([
+    Directory({ path: "MyApp.app/Contents/MacOS/", mode: Unix(0o755), modified }),
+    File({ path: "MyApp.app/Contents/MacOS/MyApp", content: program, mode: Unix(0o755), modified }),
+    File({ path: "MyApp.app/Contents/Info.plist", content: plist, mode: Unix(0o644), modified }),
+], Balanced)
+```
+
+`mode` and `modified` are optional. Left out, an entry is written exactly as `Zip.create` writes it, with no mode and the time 1980-01-01 00:00. A list of items built in a lambda needs an annotation, `items : List(Zip.Item)`, for those defaults to apply. `Zip.entries` reports each entry's `mode` (`Unix(st_mode)` when the archive was made on Unix, otherwise `NotRecorded`) and `modified`.
 
 ## Reading untrusted archives
 

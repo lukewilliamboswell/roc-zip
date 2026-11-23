@@ -25,6 +25,7 @@ import pf.Path
 import pf.Env
 import pf.IOErr
 import pf.OsStr
+import pf.System
 import zip.Zip
 
 main! = |args| {
@@ -47,6 +48,9 @@ main! = |args| {
 
 	Stdout.line!("== forward: real tools read a ZIP64 end of central directory")?
 	check_zip64!(tmp, n)?
+
+	Stdout.line!("== forward: real tools restore Unix modes and times")?
+	check_modes!(tmp, n)?
 
 	Stdout.line!("All forward interop checks passed")?
 	Ok({})
@@ -88,6 +92,150 @@ check_copy! = |tmp, n| {
 	verify_from!(zip_os, entries, "copy", 0)?
 	Path.delete!(zip_path) ? |_| Exit(1)
 	Stdout.line!("  copy: ${index.len().to_str()} entries, ${archive.len().to_str()} bytes, unzip + bsdtar + 7z all agree")
+}
+
+# The items of a small app bundle, each with its mode, and every file and
+# directory a mode string `ls -l` prints for it. A program keeps its execute
+# bits, and the modes beside 0755 and 0644 show the bits are not a default.
+mode_items : U64 -> List({ item : Zip.Item, content : List(U8), ls : Str })
+mode_items = |n| {
+	modified = Zip.dos_time(1_699_999_999 + n)
+	program = repeated_text(20 * n)
+	[
+		{ item: Directory({ path: "My.app", mode: Unix(0o755), modified }), content: [], ls: "drwxr-xr-x" },
+		{ item: Directory({ path: "My.app/Contents/", mode: Unix(0o755), modified }), content: [], ls: "drwxr-xr-x" },
+		{ item: Directory({ path: "My.app/Contents/MacOS/", mode: Unix(0o755), modified }), content: [], ls: "drwxr-xr-x" },
+		{ item: File({ path: "My.app/Contents/MacOS/My", content: program, mode: Unix(0o755), modified }), content: program, ls: "-rwxr-xr-x" },
+		{ item: File({ path: "My.app/Contents/Info.plist", content: "<plist/>".to_utf8(), mode: Unix(0o644), modified }), content: "<plist/>".to_utf8(), ls: "-rw-r--r--" },
+		{ item: Directory({ path: "My.app/Contents/Private/", mode: Unix(0o700), modified }), content: [], ls: "drwx------" },
+		{ item: File({ path: "My.app/Contents/Private/key", content: [1, 2, 3], mode: Unix(0o600), modified }), content: [1, 2, 3], ls: "-rw-------" },
+	]
+}
+
+# An archive of items with Unix modes and a time. unzip -Z must list each
+# entry as made on Unix with its mode and the time, and unzip, bsdtar and
+# (on macOS) ditto must restore each mode when they extract it.
+check_modes! : Path.Path, U64 => Try({}, [Exit(I32), Interrupted, StdoutErr(IOErr)])
+check_modes! = |tmp, n| {
+	listed = mode_items(n)
+	items = listed.map(|entry| entry.item)
+	archive = Zip.create_items(items, Balanced) ?? []
+	if Zip.create_items(items, Balanced) != Ok(archive) or archive.is_empty() {
+		Stdout.line!("  modes: create_items failed or was not deterministic")?
+		Err(Exit(1))?
+	}
+	index = Zip.entries(archive) ?? []
+	paths = index.map(|entry| entry.path)
+
+	zip_path = tmp.join("roc_zip_harness_modes.zip")
+	Path.write_bytes!(zip_path, archive) ? |_| Exit(1)
+	zip_os = OsStr.from_raw(Path.to_raw(zip_path))
+	expect_ok!("unzip", [OsStr.from_str("-tqq"), zip_os], "modes")?
+	expect_ok!("7z", [OsStr.from_str("t"), zip_os], "modes")?
+
+	# zipinfo's short listing, one line per entry: mode, version, host,
+	# sizes, type, method, then (with -T) the time as yyyymmdd.hhmmss, and
+	# the name.
+	listing = stdout_of!("unzip", [OsStr.from_str("-Z"), OsStr.from_str("-T"), zip_os], "modes")?
+	lines = listing.split_on("\n").keep_if(|line| line.starts_with("d") or line.starts_with("-"))
+	expected = listed.map_with_index(|entry, i| "${entry.ls} unx ${paths.get(i) ?? ""}")
+	got = lines.map(
+		|line| {
+			fields = line.split_on(" ").keep_if(|field| !field.is_empty())
+			"${fields.get(0) ?? ""} ${fields.get(2) ?? ""} ${fields.get(fields.len() - 1) ?? ""}"
+		},
+	)
+	if got != expected {
+		Stdout.line!("  modes: unzip -Z listed\n${listing}")?
+		Err(Exit(1))?
+	}
+	stamp = dos_stamp(Zip.dos_time(1_699_999_999 + n))
+	if !lines.all(|line| line.contains(" ${stamp} ")) {
+		Stdout.line!("  modes: unzip -Z did not show the time ${stamp}:\n${listing}")?
+		Err(Exit(1))?
+	}
+
+	target = System.target!()
+	extractors = match target.os() {
+		MacOS(_) => ["unzip", "bsdtar", "ditto"]
+		Linux(_) => ["unzip", "bsdtar"]
+		# Windows has no Unix modes to restore.
+		Windows(_) => []
+	}
+	for extractor in extractors {
+		into = tmp.join("roc_zip_harness_modes_${extractor}")
+		match Path.delete_all!(into) {
+			_ => {}
+		}
+		Path.create_all!(into) ? |_| Exit(1)
+		into_os = OsStr.from_raw(Path.to_raw(into))
+		arguments = match extractor {
+			"unzip" => [OsStr.from_str("-q"), zip_os, OsStr.from_str("-d"), into_os]
+			"bsdtar" => [OsStr.from_str("-xf"), zip_os, OsStr.from_str("-C"), into_os]
+			_ => [OsStr.from_str("-x"), OsStr.from_str("-k"), zip_os, into_os]
+		}
+		expect_ok!(extractor, arguments, "modes")?
+		for entry in listed.map_with_index(|entry, i| { path: paths.get(i) ?? "", ls: entry.ls, content: entry.content }) {
+			on_disk = into.join(entry.path.drop_suffix("/"))
+			mode = ls_mode!(on_disk, "modes")?
+			if mode != entry.ls {
+				Stdout.line!("  modes: ${extractor} gave ${entry.path} ${mode}, not ${entry.ls}")?
+				Err(Exit(1))?
+			}
+			if !entry.path.ends_with("/") {
+				bytes = Path.read_bytes!(on_disk) ? |_| Exit(1)
+				if bytes != entry.content {
+					Stdout.line!("  modes: ${extractor} MISMATCH on ${entry.path}")?
+					Err(Exit(1))?
+				}
+			}
+		}
+		Path.delete_all!(into) ? |_| Exit(1)
+	}
+
+	Path.delete!(zip_path) ? |_| Exit(1)
+	Stdout.line!("  modes: ${index.len().to_str()} entries, unzip -Z lists every mode and the time, ${Str.join_with(extractors, " + ")} restore every mode")
+}
+
+# A DOS time as zipinfo's -T prints it, yyyymmdd.hhmmss.
+dos_stamp : Zip.DosTime -> Str
+dos_stamp = |{ date, time }| {
+	two = |value| if value < 10 { "0${value.to_str()}" } else { value.to_str() }
+	year = (date.shr_zf_wrap(9) + 1980).to_str()
+	month = two(date.shr_zf_wrap(5).bitwise_and(0xF))
+	day = two(date.bitwise_and(0x1F))
+	hour = two(time.shr_zf_wrap(11))
+	minute = two(time.shr_zf_wrap(5).bitwise_and(0x3F))
+	second = two(time.bitwise_and(0x1F) * 2)
+	"${year}${month}${day}.${hour}${minute}${second}"
+}
+
+# The mode string `ls -ld` prints for a path, without the marker macOS
+# appends for extended attributes or an ACL.
+ls_mode! : Path.Path, Str => Try(Str, [Exit(I32), Interrupted, StdoutErr(IOErr)])
+ls_mode! = |path, name| {
+	line = stdout_of!("ls", [OsStr.from_str("-ld"), OsStr.from_raw(Path.to_raw(path))], name)?
+	mode = line.split_on(" ").get(0) ?? ""
+	Ok(Str.from_utf8_lossy(mode.to_utf8().take_first(10)))
+}
+
+# Run a command and return its stdout, failing the script on a nonzero exit.
+stdout_of! : Str, List(OsStr), Str => Try(Str, [Exit(I32), Interrupted, StdoutErr(IOErr)])
+stdout_of! = |program, arguments, name| {
+	output = match Cmd.new(OsStr.from_str(program)).args(arguments).run!() {
+		Ok(res) => res
+		Err(_) => {
+			Stdout.line!("  ${name}: could not run ${program}")?
+			Err(Exit(1))?
+		}
+	}
+	match output.status {
+		Exited(0) => Ok(Str.from_utf8_lossy(output.stdout_bytes))
+		status => {
+			Stdout.line!("  ${name}: ${program} ${Str.inspect(status)}: ${output.stderr_utf8_lossy()}")?
+			Err(Exit(1))
+		}
+	}
 }
 
 # More than 65535 entries overflows the classic 16-bit entry count, so the
