@@ -43,12 +43,14 @@
         devShells = {
           default = pkgs.mkShell {
             # tests.roc hands the archives we write to unzip, bsdtar (libarchive)
-            # and 7z and compares the bytes they hand back. Providing them here
-            # means the script never assumes host tools.
+            # and 7z and compares the bytes they hand back, and reads what
+            # Info-ZIP's zip and bsdtar write. Providing them here means the
+            # script never assumes host tools.
             buildInputs = [
               roc
               pkgs.watchexec
               pkgs.unzip
+              pkgs.zip
               pkgs.libarchive
               pkgs.p7zip
             ];

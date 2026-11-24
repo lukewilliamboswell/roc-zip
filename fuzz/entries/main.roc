@@ -9,9 +9,11 @@ import zip.Zip
 ## Any bytes give `Ok` or a structured `Err` from `Zip.entries`, never a
 ## crash, and the same answer twice. A listed index names every entry once
 ## and locates data inside the archive. Where `Zip.extract` also succeeds it
-## agrees with the index on paths, order and sizes. Copying every entry
-## through `Zip.compressed` and `Copied` never crashes, and the copy lists
-## the same entries.
+## agrees with the index on paths, order and sizes. `Zip.kind` calls an entry
+## a directory exactly when its name ends in `/` and its mode allows one, and
+## a link only when its mode says so. Copying every entry through
+## `Zip.compressed` and `Copied` never crashes, and the copy lists the same
+## entries.
 ##
 ## Memory ratchet, which only ever moves down: listing holds at most
 ## `C + k × input` bytes live, however large the sizes the entries declare.
@@ -33,6 +35,9 @@ test! = |bytes| {
 			}
 			if index.any(|entry| entry.data_offset + entry.compressed_size > bytes.len()) {
 				crash "an entry's data lies outside the archive"
+			}
+			for entry in index {
+				check_kind(entry)
 			}
 			match Zip.extract(bytes) {
 				Ok(extracted) => {
@@ -79,6 +84,27 @@ check_copy! = |bytes, index| {
 	}
 }
 
+# A directory's name ends in `/` and a file's or a link's does not. A link's
+# mode has the link type, and a directory's either the directory type, the
+# regular file type or none.
+check_kind : Zip.Entry -> {}
+check_kind = |entry| {
+	file_type = match entry.mode {
+		Unix(mode) => mode.bitwise_and(0o170000)
+		NotRecorded => 0
+	}
+	slash = entry.path.ends_with("/")
+	consistent = match Zip.kind(entry) {
+		Directory => slash and [0, 0o040000, 0o100000].contains(file_type)
+		File => !slash and (file_type == 0 or file_type == 0o100000)
+		SymbolicLink => !slash and file_type == 0o120000
+		Other => !(file_type == 0 or file_type == 0o100000) and !(slash and file_type == 0o040000)
+	}
+	if !consistent {
+		crash "Zip.kind called ${Str.inspect(entry.path)} with ${Str.inspect(entry.mode)} ${Str.inspect(Zip.kind(entry))}"
+	}
+}
+
 # Measured on nightly-2026-11-07-ad3a5d2 with roc-fuzz 0.5.0.
 memory_ceiling : U64 -> U64
 memory_ceiling = |input_bytes| 1024 + 8 * input_bytes
@@ -105,6 +131,18 @@ declares_gigabytes = || {
 	$bytes
 }
 
+# A directory, a file and a link, each with a mode.
+every_kind : () -> List(U8)
+every_kind = || {
+	items : List(Zip.Item)
+	items = [
+		Directory({ path: "d", mode: Unix(0o755) }),
+		File({ path: "d/f", content: "f".to_utf8(), mode: Unix(0o644) }),
+		SymbolicLink({ path: "d/l", target: "f" }),
+	]
+	Zip.create_items(items, None) ?? crash "the paths are valid"
+}
+
 u16_at : List(U8), U64 -> U64
 u16_at = |bytes, at| (bytes.get(at) ?? 0).to_u64() + (bytes.get(at + 1) ?? 0).to_u64().shl_wrap(8)
 
@@ -121,6 +159,7 @@ target = Fuzz.target_with!({
 		Fuzz.example({ name: "empty", revision: "1", make: || [] }),
 		Fuzz.example({ name: "small-archive", revision: "1", make: || Zip.create([{ path: "a.txt", content: "a".to_utf8() }, { path: "dir/", content: [] }], Balanced) ?? [] }),
 		Fuzz.example({ name: "declares-gigabytes", revision: "1", make: declares_gigabytes }),
+		Fuzz.example({ name: "every-kind", revision: "1", make: every_kind }),
 	],
 	generator: Fuzz.bytes,
 	test!,

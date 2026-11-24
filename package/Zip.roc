@@ -9,7 +9,8 @@
 ## [Zip.extract_entry] (inflated, within a size limit) or [Zip.compressed]
 ## (as stored). [Zip.writer] writes an archive one entry at a time.
 ## [Zip.create_items] records a Unix mode and a modification time for each
-## file and directory, so programs keep their execute bits when extracted.
+## file and directory, so programs keep their execute bits when extracted,
+## and writes symbolic links. [Zip.kind] says which of those an entry is.
 import crc32.Crc32
 import deflate.Deflate
 
@@ -72,6 +73,13 @@ s_ifreg = 0o100000
 
 s_ifdir : U16
 s_ifdir = 0o040000
+
+s_iflnk : U16
+s_iflnk = 0o120000
+
+# S_IFMT, the mask of the file type bits.
+s_ifmt : U16
+s_ifmt = 0o170000
 
 permission_bits : U16
 permission_bits = 0o7777
@@ -258,8 +266,29 @@ Zip := [].{
 		modified : DosTime ?? { date: 0x0021, time: 0 },
 	}
 
-	## One entry for [Zip.create_items]: a file or a directory, with metadata.
-	Item : [File(FileEntry), Directory(DirectoryEntry)]
+	## A symbolic link, for [Zip.create_items] and [Zip.add]. It is written as
+	## `zip -y` writes one: an entry made on Unix whose content is `target`
+	## and whose external attributes hold `S_IFLNK | 0777`, which unzip,
+	## bsdtar and ditto restore as a link.
+	##
+	## ```roc
+	## Zip.add(writer, SymbolicLink({ path: "lib/current", target: "v2" }))
+	## ```
+	##
+	## Nothing checks `target`. A `path` ending in `/` is extracted as a
+	## directory, so give a link's path without one.
+	SymbolicLinkEntry := {
+		path : Str,
+		target : Str,
+		modified : DosTime ?? { date: 0x0021, time: 0 },
+	}
+
+	## One entry for [Zip.create_items]: a file, a directory or a symbolic
+	## link, with metadata.
+	Item : [File(FileEntry), Directory(DirectoryEntry), SymbolicLink(SymbolicLinkEntry)]
+
+	## What an entry is, from [Zip.kind].
+	EntryKind : [File, Directory, SymbolicLink, Other]
 
 	## Create a ZIP archive from a list of entries. Returns the archive as bytes.
 	##
@@ -284,9 +313,9 @@ Zip := [].{
 	create : List(ZipEntry), Compression -> Try(List(U8), CreateError)
 	create = |files, compression| create_pending(files.map(content_pending), compression)
 
-	## Create a ZIP archive from files and directories with metadata: a Unix
-	## mode and a modification time per entry (see [Zip.FileEntry] and
-	## [Zip.DirectoryEntry]).
+	## Create a ZIP archive from files, directories and symbolic links with
+	## metadata: a Unix mode and a modification time per entry (see
+	## [Zip.FileEntry], [Zip.DirectoryEntry] and [Zip.SymbolicLinkEntry]).
 	##
 	## ```roc
 	## Zip.create_items([
@@ -473,16 +502,19 @@ Zip := [].{
 	## chunk. A `Content` or `File` entry is compressed whole with the
 	## writer's compression, falling back to store, and its CRC and sizes are
 	## known before its header is written, so the archive has no data
-	## descriptors. A `Directory` is stored empty. `File` and `Directory`
-	## carry a Unix mode and a time, as in [Zip.create_items]. A `Copied`
+	## descriptors. A `Directory` is stored empty, and a `SymbolicLink`'s
+	## content is its target. `File`, `Directory` and `SymbolicLink` carry a
+	## Unix mode and a time, as in [Zip.create_items]. A `Copied`
 	## entry keeps the method, CRC, sizes and bytes it was read with, but not
-	## its mode or time, which are written as for `Content`.
-	add : Writer, [Content(ZipEntry), Copied(Compressed), File(Zip.FileEntry), Directory(Zip.DirectoryEntry)] -> Try({ writer : Writer, chunk : List(U8) }, CreateError)
+	## its mode or time, which are written as for `Content`, so a copied
+	## symbolic link is a file holding its target.
+	add : Writer, [Content(ZipEntry), Copied(Compressed), File(Zip.FileEntry), Directory(Zip.DirectoryEntry), SymbolicLink(Zip.SymbolicLinkEntry)] -> Try({ writer : Writer, chunk : List(U8) }, CreateError)
 	add = |w, item| {
 		source = match item {
 			Content(entry) => Fresh(content_pending(entry))
 			File(file) => Fresh(file_pending(file))
 			Directory(directory) => Fresh(directory_pending(directory))
+			SymbolicLink(link) => Fresh(link_pending(link))
 			Copied(copy) => Copy(copy)
 		}
 		path = match source {
@@ -557,6 +589,58 @@ Zip := [].{
 			# backslashes since some Windows tools write them anyway.
 			path.split_on("/").all(|part| part.split_on("\\").all(|component| component != ".."))
 		}
+
+	## What an entry from [Zip.entries] is: a regular `File`, a `Directory`, a
+	## `SymbolicLink`, whose content from [Zip.extract_entry] is its target,
+	## or `Other`. This is what unzip and bsdtar make of the entry when they
+	## extract it, whichever system wrote the archive.
+	##
+	## When the entry records a Unix mode, its file type bits decide. When it
+	## records none, as on Windows, or a mode without type bits, as some
+	## writers do, the name decides: a directory's ends in `/`. A name ending
+	## in `/` is a directory whenever its mode is a directory's or a regular
+	## file's, since both readers make one.
+	##
+	## `Other` is a device, FIFO or socket, or an entry whose mode and name
+	## disagree in a way readers resolve differently: unzip extracts a
+	## directory mode on a name without `/` as a file, and bsdtar as a
+	## directory. A program that writes only files and directories should
+	## refuse `SymbolicLink` and `Other` entries.
+	##
+	## ```roc
+	## for entry in Zip.entries(zip_bytes)? {
+	## 	match Zip.kind(entry) {
+	## 		File => # write Zip.extract_entry's bytes to entry.path
+	## 		Directory => # create entry.path
+	## 		SymbolicLink | Other => return Err(Unsupported(entry.path))
+	## 	}
+	## }
+	## ```
+	kind : Entry -> EntryKind
+	kind = |entry| {
+		directory_name = entry.path.ends_with("/")
+		file_type = match entry.mode {
+			Unix(mode) => mode.bitwise_and(s_ifmt)
+			NotRecorded => 0
+		}
+		if file_type == 0 or file_type == s_ifreg {
+			if directory_name {
+				Directory
+			} else {
+				File
+			}
+		} else if file_type == s_ifdir {
+			if directory_name {
+				Directory
+			} else {
+				Other
+			}
+		} else if file_type == s_iflnk and !directory_name {
+			SymbolicLink
+		} else {
+			Other
+		}
+	}
 }
 
 # --- Writing ---
@@ -591,6 +675,7 @@ item_pending = |item|
 	match item {
 		File(file) => file_pending(file)
 		Directory(directory) => directory_pending(directory)
+		SymbolicLink(link) => link_pending(link)
 	}
 
 file_pending : Zip.FileEntry -> Pending
@@ -611,6 +696,15 @@ directory_pending = |directory| {
 	},
 	content: [],
 	meta: mode_meta(directory.mode, s_ifdir, msdos_directory, directory.modified),
+}
+
+# A link is always made on Unix, since nothing else records one. Linux gives
+# every link 0777, and readers ignore a link's permissions anyway.
+link_pending : Zip.SymbolicLinkEntry -> Pending
+link_pending = |link| {
+	path: link.path,
+	content: link.target.to_utf8(),
+	meta: mode_meta(Unix(0o777), s_iflnk, 0, link.modified),
 }
 
 # With a Unix mode, the entry is made on Unix and the mode, with its file
@@ -2093,8 +2187,8 @@ expect {
 # Unix mode and time tests
 
 # An app bundle's worth of items, out of path order on purpose: a directory
-# without its slash, a program, a plain file and an empty file, each with its
-# own time.
+# without its slash, a program, a plain file, an empty file and a link, each
+# with its own time.
 app_items : List(Zip.Item)
 app_items = [
 	Directory({ path: "My.app", mode: Unix(0o755), modified: Zip.dos_time(1_700_000_000) }),
@@ -2102,6 +2196,7 @@ app_items = [
 	File({ path: "My.app/Contents/Info.plist", content: "<plist/>".to_utf8(), mode: Unix(0o644) }),
 	Directory({ path: "My.app/Contents/Resources/" }),
 	File({ path: "My.app/Contents/PkgInfo", content: [] }),
+	SymbolicLink({ path: "My.app/Current", target: "Contents/MacOS/My", modified: Zip.dos_time(1_700_000_004) }),
 ]
 
 # Every item reads back with its path, order, mode, time and content, at
@@ -2113,10 +2208,11 @@ expect {
 				Ok(archive) =>
 					match (Zip.entries(archive), Zip.extract(archive)) {
 						(Ok(index), Ok(extracted)) =>
-							index.map(|entry| entry.path) == ["My.app/", "My.app/Contents/MacOS/My", "My.app/Contents/Info.plist", "My.app/Contents/Resources/", "My.app/Contents/PkgInfo"]
-								and index.map(|entry| entry.mode) == [Unix(0o040755), Unix(0o100755), Unix(0o100644), NotRecorded, NotRecorded]
-								and index.map(|entry| entry.modified) == [Zip.dos_time(1_700_000_000), Zip.dos_time(1_700_000_002), Zip.dos_time(0), Zip.dos_time(0), Zip.dos_time(0)]
-								and extracted.map(|entry| entry.content) == [[], word_salad(500), "<plist/>".to_utf8(), [], []]
+							index.map(|entry| entry.path) == ["My.app/", "My.app/Contents/MacOS/My", "My.app/Contents/Info.plist", "My.app/Contents/Resources/", "My.app/Contents/PkgInfo", "My.app/Current"]
+								and index.map(|entry| entry.mode) == [Unix(0o040755), Unix(0o100755), Unix(0o100644), NotRecorded, NotRecorded, Unix(0o120777)]
+								and index.map(|entry| entry.modified) == [Zip.dos_time(1_700_000_000), Zip.dos_time(1_700_000_002), Zip.dos_time(0), Zip.dos_time(0), Zip.dos_time(0), Zip.dos_time(1_700_000_004)]
+								and index.map(Zip.kind) == [Directory, File, File, Directory, File, SymbolicLink]
+								and extracted.map(|entry| entry.content) == [[], word_salad(500), "<plist/>".to_utf8(), [], [], "Contents/MacOS/My".to_utf8()]
 						_ => Bool.False
 					}
 				Err(_) => Bool.False
@@ -2197,6 +2293,7 @@ expect {
 				added = match item {
 					File(file) => Zip.add($writer, File(file))
 					Directory(directory) => Zip.add($writer, Directory(directory))
+					SymbolicLink(link) => Zip.add($writer, SymbolicLink(link))
 				}
 				match added {
 					Ok(next) => {
@@ -2250,6 +2347,124 @@ expect Zip.dos_time(315_532_800) == { date: 0x0021, time: 0 }
 expect Zip.dos_time(1_700_000_000) == dos(2023, 11, 14, 22, 13, 20)
 expect Zip.dos_time(951_827_697) == dos(2000, 2, 29, 12, 34, 56)
 expect Zip.dos_time(U64.highest) == dos(2107, 12, 31, 23, 59, 58)
+
+# Symbolic link and entry kind tests
+
+# A link's central header: made on Unix, S_IFLNK | 0777 in the high 16 bits
+# of the external attributes, its time in both headers, and its target as
+# its stored content.
+expect {
+	modified = { date: 0x5B6E, time: 0xB1AA }
+	archive = Zip.create_items([SymbolicLink({ path: "l", target: "a/b", modified })], Balanced) ?? []
+	# Local header (30) + name (1) + target (3)
+	central = 34
+	archive.sublist({ start: 8, len: 2 }) == [0, 0]
+		and archive.sublist({ start: 10, len: 4 }) == [0xAA, 0xB1, 0x6E, 0x5B]
+		and archive.sublist({ start: 31, len: 3 }) == "a/b".to_utf8()
+		and archive.sublist({ start: central + 4, len: 2 }) == [20, 3]
+		and archive.sublist({ start: central + 12, len: 4 }) == [0xAA, 0xB1, 0x6E, 0x5B]
+		and decode_u32_le(archive, central + 38) == Ok(0xA1FF0000)
+}
+
+# A target long enough to compress is deflated like any content, and reads
+# back whole, at every compression.
+expect {
+	target = Str.repeat("../", 200).concat("target")
+	[None, Fastest, Balanced, Smallest].all(
+		|compression|
+			match Zip.create_items([SymbolicLink({ path: "deep", target })], compression) {
+				Ok(archive) =>
+					match Zip.entries(archive) {
+						Ok([entry]) =>
+							Zip.kind(entry) == SymbolicLink
+								and (entry.method == Deflated) == (compression != None)
+								and Zip.extract_entry(archive, entry, {}) == Ok(target.to_utf8())
+						_ => Bool.False
+					}
+				Err(_) => Bool.False
+			},
+	)
+}
+
+# A link's path is checked like any other, and the writer's chunk is what
+# create_items writes.
+expect {
+	link : Zip.Item
+	link = SymbolicLink({ path: "a", target: "b" })
+	added = Zip.add(Zip.writer({ compression: None }), SymbolicLink({ path: "a", target: "b" }))
+	Zip.create_items([File({ path: "a", content: [] }), link], None) == Err(DuplicatePath("a"))
+		and Zip.create_items([SymbolicLink({ path: "", target: "b" })], None) == Err(EmptyPath(""))
+		and added.map_ok(|{ writer, chunk }| chunk.concat(Zip.finish(writer))) == Zip.create_items([link], None)
+}
+
+# An entry with the given path and mode, for kind tests.
+kind_of : Str, Zip.UnixMode -> Zip.EntryKind
+kind_of = |path, mode|
+	Zip.kind({ path, method: Stored, crc: 0, compressed_size: 0, uncompressed_size: 0, data_offset: 0, mode, modified: { date: 0x0021, time: 0 } })
+
+# With no mode, or a mode without type bits, the name decides.
+expect kind_of("a", NotRecorded) == File
+expect kind_of("a/", NotRecorded) == Directory
+expect kind_of("a", Unix(0o644)) == File
+expect kind_of("a/", Unix(0o755)) == Directory
+expect kind_of("a", Unix(0)) == File
+
+# Otherwise the type bits decide, whatever the permissions.
+expect kind_of("a", Unix(0o100000)) == File
+expect kind_of("a", Unix(0o104755)) == File
+expect kind_of("a/", Unix(0o040700)) == Directory
+expect kind_of("a", Unix(0o120777)) == SymbolicLink
+expect kind_of("a", Unix(0o120000)) == SymbolicLink
+
+# unzip and bsdtar both make a directory of a regular file's mode on a name
+# ending in `/`.
+expect kind_of("a/", Unix(0o100644)) == Directory
+
+# Devices, FIFOs and sockets are Other.
+expect kind_of("a", Unix(0o010644)) == Other
+expect kind_of("a", Unix(0o020644)) == Other
+expect kind_of("a", Unix(0o060644)) == Other
+expect kind_of("a", Unix(0o140755)) == Other
+expect kind_of("a/", Unix(0o010644)) == Other
+
+# A directory's mode without a trailing `/` is a file to unzip and a
+# directory to bsdtar, and a link's mode with one is a directory to both, so
+# neither is anything a reader can rely on.
+expect kind_of("a", Unix(0o040755)) == Other
+expect kind_of("a/", Unix(0o120777)) == Other
+
+# What each writer in this package records reads back as the item it was.
+expect {
+	created = Zip.create(sample_entries, Balanced) ?? []
+	items : List(Zip.Item)
+	items = [
+		Directory({ path: "d" }),
+		Directory({ path: "e", mode: Unix(0o700) }),
+		File({ path: "e/f", content: [1] }),
+		File({ path: "e/g", content: [], mode: Unix(0o4755) }),
+		SymbolicLink({ path: "e/h", target: "f" }),
+	]
+	written = Zip.create_items(items, None) ?? []
+	(Zip.entries(created) ?? []).all(|entry| Zip.kind(entry) == File)
+		and (Zip.entries(written) ?? []).map(Zip.kind) == [Directory, Directory, File, File, SymbolicLink]
+}
+
+# Info-ZIP's `zip -y` records a link as S_IFLNK on Unix, with its target as
+# the content.
+expect {
+	index = Zip.entries(infozip_link_fixture) ?? []
+	index.map(|entry| entry.path) == ["dir/", "dir/a.txt", "link"]
+		and index.map(Zip.kind) == [Directory, File, SymbolicLink]
+		and index.map(|entry| entry.mode) == [Unix(0o040755), Unix(0o100644), Unix(0o120755)]
+		and index.map(|entry| Zip.extract_entry(infozip_link_fixture, entry, {}) ?? []) == [[], "Hello\n".to_utf8(), "dir/a.txt".to_utf8()]
+}
+
+# The fixtures from Info-ZIP's `zip -0` and `zip -9` and from bsdtar hold
+# files and a directory.
+expect {
+	[infozip_store_fixture, infozip_deflate_fixture, bsdtar_zip64_fixture].map(|fixture| (Zip.entries(fixture) ?? []).map(Zip.kind))
+		== [[File, Directory, File], [File], [File]]
+}
 
 # The DOS time of a date and a time of day, for tests.
 dos : U16, U16, U16, U16, U16, U16 -> Zip.DosTime
@@ -2420,6 +2635,11 @@ infozip_store_fixture = [80, 75, 3, 4, 10, 0, 0, 0, 0, 0, 227, 189, 231, 92, 208
 # end of central directory record and ZIP64 extra fields.
 bsdtar_zip64_fixture : List(U8)
 bsdtar_zip64_fixture = [80, 75, 3, 4, 45, 0, 8, 0, 0, 0, 227, 189, 231, 92, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9, 0, 32, 0, 104, 101, 108, 108, 111, 46, 116, 120, 116, 117, 120, 11, 0, 1, 4, 232, 3, 0, 0, 4, 100, 0, 0, 0, 85, 84, 13, 0, 7, 218, 115, 77, 106, 218, 115, 77, 106, 218, 115, 77, 106, 72, 101, 108, 108, 111, 44, 32, 87, 111, 114, 108, 100, 33, 80, 75, 7, 8, 208, 195, 74, 236, 13, 0, 0, 0, 0, 0, 0, 0, 13, 0, 0, 0, 0, 0, 0, 0, 80, 75, 1, 2, 45, 3, 45, 0, 8, 0, 0, 0, 227, 189, 231, 92, 208, 195, 74, 236, 13, 0, 0, 0, 13, 0, 0, 0, 9, 0, 24, 0, 0, 0, 0, 0, 0, 0, 0, 0, 164, 129, 0, 0, 0, 0, 104, 101, 108, 108, 111, 46, 116, 120, 116, 117, 120, 11, 0, 1, 4, 232, 3, 0, 0, 4, 100, 0, 0, 0, 85, 84, 5, 0, 1, 218, 115, 77, 106, 80, 75, 6, 6, 44, 0, 0, 0, 0, 0, 0, 0, 45, 0, 45, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 79, 0, 0, 0, 0, 0, 0, 0, 108, 0, 0, 0, 0, 0, 0, 0, 80, 75, 6, 7, 0, 0, 0, 0, 187, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 80, 75, 5, 6, 0, 0, 0, 0, 1, 0, 1, 0, 79, 0, 0, 0, 108, 0, 0, 0, 0, 0]
+
+# A store-mode archive created by Info-ZIP's `zip -X -y -0` on macOS: a
+# directory, a file, and a symbolic link to it.
+infozip_link_fixture : List(U8)
+infozip_link_fixture = [80, 75, 3, 4, 10, 0, 0, 0, 0, 0, 0, 88, 120, 93, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 100, 105, 114, 47, 80, 75, 3, 4, 10, 0, 0, 0, 0, 0, 0, 88, 120, 93, 22, 53, 150, 49, 6, 0, 0, 0, 6, 0, 0, 0, 9, 0, 0, 0, 100, 105, 114, 47, 97, 46, 116, 120, 116, 72, 101, 108, 108, 111, 10, 80, 75, 3, 4, 10, 0, 0, 0, 0, 0, 0, 88, 120, 93, 208, 9, 230, 162, 9, 0, 0, 0, 9, 0, 0, 0, 4, 0, 0, 0, 108, 105, 110, 107, 100, 105, 114, 47, 97, 46, 116, 120, 116, 80, 75, 1, 2, 30, 3, 10, 0, 0, 0, 0, 0, 0, 88, 120, 93, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 16, 0, 237, 65, 0, 0, 0, 0, 100, 105, 114, 47, 80, 75, 1, 2, 30, 3, 10, 0, 0, 0, 0, 0, 0, 88, 120, 93, 22, 53, 150, 49, 6, 0, 0, 0, 6, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 164, 129, 34, 0, 0, 0, 100, 105, 114, 47, 97, 46, 116, 120, 116, 80, 75, 1, 2, 30, 3, 10, 0, 0, 0, 0, 0, 0, 88, 120, 93, 208, 9, 230, 162, 9, 0, 0, 0, 9, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 237, 161, 79, 0, 0, 0, 108, 105, 110, 107, 80, 75, 5, 6, 0, 0, 0, 0, 3, 0, 3, 0, 155, 0, 0, 0, 122, 0, 0, 0, 0, 0]
 
 # A deflate-compressed archive created by Info-ZIP's `zip -9`.
 infozip_deflate_fixture : List(U8)

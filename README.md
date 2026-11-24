@@ -8,6 +8,7 @@ Create and extract ZIP archives in Roc.
 - `Zip.compressed` takes an entry's bytes exactly as stored, so `Zip.add` can copy it into another archive without inflating or recompressing it.
 - `Zip.writer`, `Zip.add` and `Zip.finish` write an archive one entry at a time. Each call returns the next chunk, which can go straight to a file. The chunks add up to the bytes `Zip.create` returns.
 - `Zip.create_items` (and `Zip.add` with `File` and `Directory`) records a Unix mode and a modification time per entry, and writes explicit directory entries, so an executable extracts as executable with unzip, bsdtar, ditto and Archive Utility, whichever system wrote the archive. `Zip.entries` reads both back.
+- `SymbolicLink` items write a link the way `zip -y` does, and `Zip.kind` says whether a listed entry is a file, a directory, a link or something else, whichever system wrote the archive.
 - Output is deterministic: entries keep their order, timestamps are zeroed unless you set them, and there are no data descriptors. Repeated paths are refused by the writer and rejected by the reader, since different readers resolve them differently.
 - Supports ZIP64, so files and archives larger than 4 GB work.
 - Compression comes from [roc-deflate](https://github.com/niclas-ahden/roc-deflate), a pure-Roc DEFLATE implementation. Use that package directly if you need raw DEFLATE streams (gzip, PNG, etc.) without the ZIP container.
@@ -71,6 +72,12 @@ Zip.create_items([
 
 `mode` and `modified` are optional. Left out, an entry is written exactly as `Zip.create` writes it, with no mode and the time 1980-01-01 00:00. A list of items built in a lambda needs an annotation, `items : List(Zip.Item)`, for those defaults to apply. `Zip.entries` reports each entry's `mode` (`Unix(st_mode)` when the archive was made on Unix, otherwise `NotRecorded`) and `modified`.
 
+A `SymbolicLink` item is a link whose content is its target, which unzip, bsdtar and ditto restore as a link:
+
+```roc
+SymbolicLink({ path: "MyApp.app/Contents/Current", target: "MacOS/MyApp" })
+```
+
 ## Reading untrusted archives
 
 A small archive can declare, or inflate to, gigabytes. List it first, and extract each entry within a limit:
@@ -87,6 +94,20 @@ read_parts = |bytes| {
     Ok($parts)
 }
 ```
+
+To write the entries to disk yourself, check each path with `Zip.is_safe_path` and ask `Zip.kind` what the entry is. It follows the entry's Unix mode when there is one and its name otherwise, as unzip and bsdtar do, so it needs no knowledge of which system wrote the archive. Refuse what you do not create yourself:
+
+```roc
+for entry in Zip.entries(bytes)? {
+    match Zip.kind(entry) {
+        File => # write Zip.extract_entry(bytes, entry, limits)? to entry.path
+        Directory => # create entry.path
+        SymbolicLink | Other => return Err(Unsupported(entry.path))
+    }
+}
+```
+
+`Other` covers devices, FIFOs and sockets, and entries whose mode and name contradict each other in ways readers resolve differently.
 
 Listing holds memory in proportion to the central directory, not to the sizes the entries declare. Extracting holds at most the decoder's tables and the entry's declared size. The [fuzz targets](fuzz/) check both bounds, along with the rest of the API, against arbitrary and corrupted archives.
 

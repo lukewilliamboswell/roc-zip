@@ -33,3 +33,12 @@ esac
 command -v unzip > /dev/null
 command -v 7z > /dev/null
 echo "unzip, bsdtar and 7z are available"
+
+# Info-ZIP's zip writes the links tests/harness.roc reads back. Windows skips
+# that check, since it makes no links without privileges.
+case "$(uname -s)" in
+  Linux | Darwin)
+    command -v zip > /dev/null || { sudo apt-get install -y -qq zip && command -v zip > /dev/null; }
+    echo "zip is available"
+    ;;
+esac

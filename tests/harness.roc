@@ -11,7 +11,9 @@
 ## exits 0 and prints nothing when it cannot match a name, so an exit-code check
 ## alone would pass silently on an archive no reader could actually read.
 ##
-## The three readers come from the flake dev shell:
+## It also runs the other way for symbolic links: Info-ZIP's `zip -y` and
+## bsdtar archive a tree with links, and `Zip.kind` must agree with zipinfo on
+## every entry. The tools come from the flake dev shell:
 ##
 ##     nix develop -c ./tests.roc
 app [main!] {
@@ -51,6 +53,19 @@ main! = |args| {
 
 	Stdout.line!("== forward: real tools restore Unix modes and times")?
 	check_modes!(tmp, n)?
+
+	target = System.target!()
+	match target.os() {
+		# Windows makes no symbolic links without privileges.
+		Windows(_) => {}
+		_ => {
+			Stdout.line!("== forward: real tools restore symbolic links")?
+			check_links!(tmp, n)?
+
+			Stdout.line!("== back: Zip.kind agrees with zipinfo on what zip and bsdtar write")?
+			check_kinds!(tmp, n)?
+		}
+	}
 
 	Stdout.line!("All forward interop checks passed")?
 	Ok({})
@@ -195,6 +210,181 @@ check_modes! = |tmp, n| {
 
 	Path.delete!(zip_path) ? |_| Exit(1)
 	Stdout.line!("  modes: ${index.len().to_str()} entries, unzip -Z lists every mode and the time, ${Str.join_with(extractors, " + ")} restore every mode")
+}
+
+# Links beside the file and directory they point into, one dangling and one
+# whose target is long enough to be deflated.
+link_items : U64 -> List({ item : Zip.Item, path : Str, target : Str })
+link_items = |n| {
+	long = Str.repeat("../", 100 + n).concat("Links/target.txt")
+	[
+		{ item: Directory({ path: "Links/", mode: Unix(0o755) }), path: "Links/", target: "" },
+		{ item: File({ path: "Links/target.txt", content: "pointed at".to_utf8(), mode: Unix(0o644) }), path: "Links/target.txt", target: "" },
+		{ item: SymbolicLink({ path: "Links/to-target", target: "target.txt" }), path: "Links/to-target", target: "target.txt" },
+		{ item: SymbolicLink({ path: "Links/dangling", target: "../missing" }), path: "Links/dangling", target: "../missing" },
+		{ item: SymbolicLink({ path: "Links/long", target: long }), path: "Links/long", target: long },
+	]
+}
+
+# An archive with symbolic links. unzip -Z must list each link as one made on
+# Unix, `unzip -p` must print its target, and unzip, bsdtar and (on macOS)
+# ditto must make each one a link to its target when they extract it.
+check_links! : Path.Path, U64 => Try({}, [Exit(I32), Interrupted, StdoutErr(IOErr)])
+check_links! = |tmp, n| {
+	listed = link_items(n)
+	items = listed.map(|entry| entry.item)
+	archive = Zip.create_items(items, Balanced) ?? []
+	if Zip.create_items(items, Balanced) != Ok(archive) or archive.is_empty() {
+		Stdout.line!("  links: create_items failed or was not deterministic")?
+		Err(Exit(1))?
+	}
+	links = listed.keep_if(|entry| !entry.target.is_empty())
+	deflated = (Zip.entries(archive) ?? []).keep_if(|entry| entry.method == Deflated).map(|entry| entry.path)
+	if !deflated.contains("Links/long") {
+		Stdout.line!("  links: the long target was not deflated, so a deflated link goes untested")?
+		Err(Exit(1))?
+	}
+
+	zip_path = tmp.join("roc_zip_harness_links.zip")
+	Path.write_bytes!(zip_path, archive) ? |_| Exit(1)
+	zip_os = OsStr.from_raw(Path.to_raw(zip_path))
+	expect_ok!("unzip", [OsStr.from_str("-tqq"), zip_os], "links")?
+	expect_ok!("7z", [OsStr.from_str("t"), zip_os], "links")?
+	_ = check_zipinfo_kinds!(archive, zip_os, "links")?
+	for link in links {
+		expect_bytes!("unzip", [OsStr.from_str("-p"), zip_os, OsStr.from_str(link.path)], { path: link.path, content: link.target.to_utf8() }, "links")?
+	}
+
+	target = System.target!()
+	extractors = match target.os() {
+		MacOS(_) => ["unzip", "bsdtar", "ditto"]
+		_ => ["unzip", "bsdtar"]
+	}
+	for extractor in extractors {
+		into = tmp.join("roc_zip_harness_links_${extractor}")
+		match Path.delete_all!(into) {
+			_ => {}
+		}
+		Path.create_all!(into) ? |_| Exit(1)
+		into_os = OsStr.from_raw(Path.to_raw(into))
+		arguments = match extractor {
+			"unzip" => [OsStr.from_str("-q"), zip_os, OsStr.from_str("-d"), into_os]
+			"bsdtar" => [OsStr.from_str("-xf"), zip_os, OsStr.from_str("-C"), into_os]
+			_ => [OsStr.from_str("-x"), OsStr.from_str("-k"), zip_os, into_os]
+		}
+		expect_ok!(extractor, arguments, "links")?
+		for link in links {
+			on_disk = into.join(link.path)
+			mode = ls_mode!(on_disk, "links")?
+			made = stdout_of!("readlink", [OsStr.from_raw(Path.to_raw(on_disk))], "links")?
+			if !mode.starts_with("l") or made != "${link.target}\n" {
+				Stdout.line!("  links: ${extractor} made ${link.path} ${mode} to ${made}, not a link to ${link.target}")?
+				Err(Exit(1))?
+			}
+		}
+		pointed = Path.read_bytes!(into.join("Links/to-target")) ? |_| Exit(1)
+		if pointed != "pointed at".to_utf8() {
+			Stdout.line!("  links: ${extractor}'s Links/to-target does not reach Links/target.txt")?
+			Err(Exit(1))?
+		}
+		Path.delete_all!(into) ? |_| Exit(1)
+	}
+
+	Path.delete!(zip_path) ? |_| Exit(1)
+	Stdout.line!("  links: ${links.len().to_str()} links, unzip -Z lists each, unzip -p prints each target, ${Str.join_with(extractors, " + ")} restore each")
+}
+
+# The other direction: a tree with a file, a program, an empty file, nested
+# and empty directories and two links, archived by Info-ZIP's `zip -y` and by
+# bsdtar. Zip.kind must say of every entry what zipinfo's mode string says,
+# and every file must extract to the bytes `unzip -p` prints.
+check_kinds! : Path.Path, U64 => Try({}, [Exit(I32), Interrupted, StdoutErr(IOErr)])
+check_kinds! = |tmp, n| {
+	root = tmp.join("roc_zip_harness_kinds")
+	match Path.delete_all!(root) {
+		_ => {}
+	}
+	tree = root.join("tree")
+	Path.create_all!(tree.join("sub/deeper")) ? |_| Exit(1)
+	Path.create_all!(tree.join("empty")) ? |_| Exit(1)
+	Path.write_bytes!(tree.join("a.txt"), repeated_text(n)) ? |_| Exit(1)
+	Path.write_bytes!(tree.join("run.sh"), "#!/bin/sh\necho hi\n".to_utf8()) ? |_| Exit(1)
+	Path.write_bytes!(tree.join("sub/deeper/zero"), []) ? |_| Exit(1)
+	in_tree = |relative| OsStr.from_raw(Path.to_raw(tree.join(relative)))
+	expect_ok!("chmod", [OsStr.from_str("755"), in_tree("run.sh")], "kinds")?
+	expect_ok!("ln", [OsStr.from_str("-s"), OsStr.from_str("a.txt"), in_tree("link")], "kinds")?
+	expect_ok!("ln", [OsStr.from_str("-s"), OsStr.from_str("../nowhere"), in_tree("sub/dangling")], "kinds")?
+
+	writers = [
+		{ name: "zip -y", archive: "infozip.zip", program: "zip", arguments: ["-X", "-q", "-r", "-y"] },
+		{ name: "bsdtar", archive: "bsdtar.zip", program: "bsdtar", arguments: ["--format", "zip", "-cf"] },
+	]
+	for writer in writers {
+		zip_path = root.join(writer.archive)
+		zip_os = OsStr.from_raw(Path.to_raw(zip_path))
+		# Both are run from the root so the entries are named tree/...
+		made = match Cmd.new(OsStr.from_str(writer.program)).args(writer.arguments.map(OsStr.from_str).concat([zip_os, OsStr.from_str("tree")])).cwd(root).run!() {
+			Ok(output) => output.status == Exited(0)
+			Err(_) => Bool.False
+		}
+		if !made {
+			Stdout.line!("  kinds: ${writer.name} could not archive the tree")?
+			Err(Exit(1))?
+		}
+		archive = Path.read_bytes!(zip_path) ? |_| Exit(1)
+		kinds = check_zipinfo_kinds!(archive, zip_os, writer.name)?
+		for want in [("tree/link", SymbolicLink), ("tree/sub/dangling", SymbolicLink), ("tree/empty/", Directory), ("tree/run.sh", File)] {
+			(path, kind) = want
+			if !kinds.contains((path, kind)) {
+				Stdout.line!("  kinds: ${writer.name}'s archive has no ${path} of the kind expected")?
+				Err(Exit(1))?
+			}
+		}
+		for entry in Zip.entries(archive) ?? [] {
+			if Zip.kind(entry) == File {
+				content = Zip.extract_entry(archive, entry, {}) ?? []
+				expect_bytes!("unzip", [OsStr.from_str("-p"), zip_os, OsStr.from_str(entry.path)], { path: entry.path, content }, writer.name)?
+			}
+		}
+	}
+	Path.delete_all!(root) ? |_| Exit(1)
+	Stdout.line!("  kinds: zip -y and bsdtar archives, Zip.kind agrees with zipinfo on every entry and every file matches unzip -p")
+}
+
+# List an archive with zipinfo, and require Zip.kind to say of each entry
+# what the first character of its mode string does: `-` a file, `d` a
+# directory and `l` a link. Returns each path with its kind.
+check_zipinfo_kinds! : List(U8), OsStr, Str => Try(List((Str, Zip.EntryKind)), [Exit(I32), Interrupted, StdoutErr(IOErr)])
+check_zipinfo_kinds! = |archive, zip_os, name| {
+	index = match Zip.entries(archive) {
+		Ok(listed) => listed
+		Err(err) => {
+			Stdout.line!("  ${name}: Zip.entries failed: ${Str.inspect(err)}")?
+			Err(Exit(1))?
+		}
+	}
+	listing = stdout_of!("unzip", [OsStr.from_str("-Z"), OsStr.from_str("-1"), zip_os], name)?
+	modes = stdout_of!("unzip", [OsStr.from_str("-Z"), OsStr.from_str("-s"), zip_os], name)?
+	names = listing.split_on("\n").keep_if(|line| !line.is_empty())
+	letters = modes.split_on("\n").keep_if(|line| line.starts_with("-") or line.starts_with("d") or line.starts_with("l")).map(|line| Str.from_utf8_lossy(line.to_utf8().take_first(1)))
+	if names != index.map(|entry| entry.path) or letters.len() != index.len() {
+		Stdout.line!("  ${name}: zipinfo listed\n${modes}")?
+		Err(Exit(1))?
+	}
+	kinds = index.map(|entry| (entry.path, Zip.kind(entry)))
+	for (i, entry) in index.map_with_index(|entry, i| (i, entry)) {
+		expected = match letters.get(i) ?? "" {
+			"-" => File
+			"d" => Directory
+			"l" => SymbolicLink
+			_ => Other
+		}
+		if Zip.kind(entry) != expected {
+			Stdout.line!("  ${name}: zipinfo says ${entry.path} is ${letters.get(i) ?? ""}, Zip.kind says ${Str.inspect(Zip.kind(entry))}")?
+			Err(Exit(1))?
+		}
+	}
+	Ok(kinds)
 }
 
 # A DOS time as zipinfo's -T prints it, yyyymmdd.hhmmss.

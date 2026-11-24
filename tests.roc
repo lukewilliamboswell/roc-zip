@@ -10,7 +10,8 @@
 ##
 ## harness is built with --opt=speed because it constructs a 65536-entry ZIP64
 ## archive, which is slow under the dev backend. unzip, bsdtar and 7z are the
-## only external tools, and the flake dev shell provides all three:
+## readers it drives, and Info-ZIP's zip and bsdtar write the archives with
+## links it reads back. The flake dev shell provides all four:
 ##
 ##     nix develop -c ./tests.roc
 ##
