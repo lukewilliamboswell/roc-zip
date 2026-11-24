@@ -23,7 +23,7 @@
 ##
 ##     .fuzz/writer run .fuzz/corpus/writer --time=600
 app [main!] {
-	pf: platform "https://github.com/roc-lang/basic-cli/releases/download/0.27.0/9yjxqdGTP4xSpSEmDazwTmRsehfRZzA19pwEKkR6fj1g.tar.zst",
+	pf: platform "https://github.com/roc-lang/basic-cli/releases/download/0.28.1/7brgwR8YUqfeGrkdfF1V4GPPN7DnP7ftqub9KcrTEZtr.tar.zst",
 }
 
 import pf.Stdout
@@ -71,7 +71,11 @@ fuzz_smoke! = |name| {
 	match Path.delete_all!(Path.utf8(report)) {
 		_ => {}
 	}
-	run!("roc", ["build", "--fuzz", "fuzz/${name}/main.roc", "--output=${executable}"])?
+	# On nightly-2026-11-18-a520eed, specialization crashes while preparing
+	# examples for entries. Keep the same examples and property with boxed calls.
+	compiler_options = if (name == "entries") ["--specialize=no"] else []
+	build_args = ["build", "--fuzz", "fuzz/${name}/main.roc", "--output=${executable}"]
+	run!("roc", build_args.concat(compiler_options))?
 	run!(executable, ["run", corpus, "--time=1", "--runs=64", "--max-input-size=4096", "--timeout=30", "--report-dir=${report}"])
 }
 
