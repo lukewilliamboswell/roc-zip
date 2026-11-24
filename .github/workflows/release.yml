@@ -20,9 +20,15 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Temporary: roc-nix cannot build a520eed; use the flake's prebuilt nightly.
   test:
     name: Required
-    uses: niclas-ahden/roc-workflows/.github/workflows/test.yml@v3
+    uses: niclas-ahden/roc-workflows/.github/workflows/suite.yml@v3
+    with:
+      roc: nightly-2026-11-18-a520eed
+      label: Tests
+      setup: .github/scripts/suite-setup.sh
+      os: '["ubuntu-24.04", "macos-15"]'
 
   draft:
     name: Draft

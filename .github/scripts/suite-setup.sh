@@ -1,9 +1,5 @@
 #!/usr/bin/env bash
-# Put the ZIP readers tests/harness.roc drives on the PATH of a bare GitHub
-# runner. The required gate gets them from the flake's dev shell, but the
-# per operating system legs run ./tests.roc straight on the runner image,
-# which is missing bsdtar in two different ways.
-#
+# Put the ZIP tools tests/harness.roc needs on a bare GitHub runner.
 # suite.yml hands this to bash, so it cannot be a .roc script.
 set -euo pipefail
 
