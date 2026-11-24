@@ -39,8 +39,10 @@ Input := { size : U8, declared : U32, truthful : Bool, limit : U8, compression :
 ## Memory ratchet, which only ever moves down.
 test! : Input => Fuzz.Outcome
 test! = |input| {
-	size = (1024).shl_wrap(input.size % 14)
-	max_bytes = (1024).shl_wrap(input.limit % 21)
+	kibibyte : U64
+	kibibyte = 1024
+	size = kibibyte.shl_wrap(input.size % 14)
+	max_bytes = kibibyte.shl_wrap(input.limit % 21)
 	declared = if input.truthful {
 		size
 	} else {
